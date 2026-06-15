@@ -62,6 +62,11 @@ TABLE_COLUMNS = [
 EXPORT_FIELDS = ["fixture_no", "model", "accessories", "location", "inspection_due_date", "person_in_charge", "status", "last_remark"]
 EXPORT_HEADERS = ["灯具编号", "型号", "配件", "库位", "巡检到期日", "负责人", "状态", "最近备注"]
 
+SETTING_FILTER_LOCATION = "filter_location"
+SETTING_FILTER_STATUS = "filter_status"
+SETTING_FILTER_DUE_START = "filter_due_start"
+SETTING_FILTER_DUE_END = "filter_due_end"
+
 
 class DatabaseManager:
     def __init__(self, db_path):
@@ -418,8 +423,40 @@ class Application(tk.Tk):
         self._build_table()
         self._build_bottom_panel()
         self._build_status_bar()
+        self._restore_filters_from_db()
+        self._apply_filters_to_controls()
         self._refresh_table()
         self._update_status_bar()
+
+    def _restore_filters_from_db(self):
+        loc = self.service.db.get_setting(SETTING_FILTER_LOCATION, "")
+        sta = self.service.db.get_setting(SETTING_FILTER_STATUS, "")
+        ds = self.service.db.get_setting(SETTING_FILTER_DUE_START, "")
+        de = self.service.db.get_setting(SETTING_FILTER_DUE_END, "")
+        self._current_filters = {
+            "location": loc or None,
+            "status": sta or None,
+            "due_start": ds or None,
+            "due_end": de or None,
+        }
+
+    def _persist_filters_to_db(self):
+        cf = self._current_filters
+        self.service.db.set_setting(SETTING_FILTER_LOCATION, cf.get("location") or "")
+        self.service.db.set_setting(SETTING_FILTER_STATUS, cf.get("status") or "")
+        self.service.db.set_setting(SETTING_FILTER_DUE_START, cf.get("due_start") or "")
+        self.service.db.set_setting(SETTING_FILTER_DUE_END, cf.get("due_end") or "")
+
+    def _apply_filters_to_controls(self):
+        cf = self._current_filters
+        self.filter_location.set(cf.get("location") or "")
+        self.filter_status.set(cf.get("status") or "")
+        self.filter_due_start.delete(0, "end")
+        if cf.get("due_start"):
+            self.filter_due_start.insert(0, cf["due_start"])
+        self.filter_due_end.delete(0, "end")
+        if cf.get("due_end"):
+            self.filter_due_end.insert(0, cf["due_end"])
 
     # ---- Menu ----
 
@@ -629,6 +666,7 @@ class Application(tk.Tk):
                 messagebox.showerror("格式错误", "到期结束日期格式应为 YYYY-MM-DD")
                 return
         self._current_filters = {"location": loc, "status": sta, "due_start": ds, "due_end": de}
+        self._persist_filters_to_db()
         self._refresh_table()
 
     def _on_reset_filter(self):
@@ -637,6 +675,7 @@ class Application(tk.Tk):
         self.filter_due_start.delete(0, "end")
         self.filter_due_end.delete(0, "end")
         self._current_filters = {}
+        self._persist_filters_to_db()
         self._refresh_table()
 
     # ---- Selection Handler ----

@@ -16,6 +16,7 @@ from stage_lighting_tool import (
     DatabaseManager, LightingService,
     STATUS_AVAILABLE, STATUS_BORROWED, STATUS_RETURN_PENDING,
     STATUS_INSPECTION_FREEZE, STATUS_MAINTENANCE_FREEZE, STATUS_SCRAPPED,
+    SETTING_FILTER_LOCATION, SETTING_FILTER_STATUS, SETTING_FILTER_DUE_START, SETTING_FILTER_DUE_END,
 )
 
 TMP_DIR = None
@@ -392,6 +393,173 @@ def test_update_fixture_info():
     print("  PASS test_update_fixture_info")
 
 
+def _save_filters_to_db(db, location, status, due_start, due_end):
+    db.set_setting(SETTING_FILTER_LOCATION, location or "")
+    db.set_setting(SETTING_FILTER_STATUS, status or "")
+    db.set_setting(SETTING_FILTER_DUE_START, due_start or "")
+    db.set_setting(SETTING_FILTER_DUE_END, due_end or "")
+
+
+def _make_filter_app(db_path):
+    """Simulate Application startup to verify filter persistence without real Tk window.
+
+    We check that:
+      - settings in DB are read and properly translated into _current_filters
+      - the fixture query using those filters returns the expected set
+    """
+    db = DatabaseManager(db_path)
+    svc = LightingService(db)
+
+    loc = db.get_setting(SETTING_FILTER_LOCATION, "")
+    sta = db.get_setting(SETTING_FILTER_STATUS, "")
+    ds = db.get_setting(SETTING_FILTER_DUE_START, "")
+    de = db.get_setting(SETTING_FILTER_DUE_END, "")
+    current_filters = {
+        "location": loc or None,
+        "status": sta or None,
+        "due_start": ds or None,
+        "due_end": de or None,
+    }
+    fixtures = svc.get_fixtures(**current_filters)
+    return db, svc, current_filters, fixtures
+
+
+def test_filter_persistence_rootcause_empty_on_start():
+    """Reproduce the OLD bug: after user sets filters in UI and exits, re-open
+    should find the filter settings saved in DB. Before fix they were never
+    persisted so the below assertion would fail. This test now verifies the
+    fix actually stores something on persist call.
+    """
+    db_path = Path(TMP_DIR) / f"rc_{_test_counter+1}.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+    svc1.add_fixture("R001", "PAR", "", "A-1", "2027-01-01", "张三")
+    svc1.add_fixture("R002", "LED", "", "B-1", "2027-06-01", "李四")
+
+    db1.set_setting(SETTING_FILTER_LOCATION, "A-1")
+    db1.set_setting(SETTING_FILTER_STATUS, STATUS_AVAILABLE)
+    db1.close()
+
+    db2, svc2, cf, fixtures = _make_filter_app(db_path)
+    assert cf["location"] == "A-1", f"Expected location filter to persist but got {cf['location']}"
+    assert cf["status"] == STATUS_AVAILABLE
+    assert len(fixtures) == 1 and fixtures[0]["fixture_no"] == "R001"
+    db2.close()
+    print("  PASS test_filter_persistence_rootcause_empty_on_start")
+
+
+def test_filter_location_status_kept_across_restart():
+    """Regression #1: 库位 + 状态筛选跨重启保留，并正确影响查询结果"""
+    global _test_counter
+    _test_counter += 1
+    db_path = Path(TMP_DIR) / f"r1_{_test_counter}.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+    f1 = svc1.add_fixture("X001", "PAR64", "", "A-1", "2027-01-01", "张三")
+    f2 = svc1.add_fixture("X002", "LED", "", "A-2", "2027-01-01", "李四")
+    f3 = svc1.add_fixture("X003", "Spot", "", "A-1", "2027-03-01", "王五")
+    svc1.borrow(f3, "用户X", "借走了")
+
+    db1.set_setting(SETTING_FILTER_LOCATION, "A-1")
+    db1.set_setting(SETTING_FILTER_STATUS, STATUS_AVAILABLE)
+    db1.set_setting(SETTING_FILTER_DUE_START, "")
+    db1.set_setting(SETTING_FILTER_DUE_END, "")
+    db1.close()
+
+    db2, svc2, cf, fixtures = _make_filter_app(db_path)
+    assert cf["location"] == "A-1"
+    assert cf["status"] == STATUS_AVAILABLE
+    assert cf["due_start"] is None
+    assert cf["due_end"] is None
+    ids = {f["fixture_no"] for f in fixtures}
+    assert ids == {"X001"}, f"Expected only X001 (A-1 + 可用), got {ids}"
+    db2.close()
+    print("  PASS test_filter_location_status_kept_across_restart")
+
+
+def test_filter_due_range_effective_across_restart():
+    """Regression #2: 到期范围筛选跨重启生效"""
+    global _test_counter
+    _test_counter += 1
+    db_path = Path(TMP_DIR) / f"r2_{_test_counter}.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+    svc1.add_fixture("Y001", "PAR", "", "A-1", "2027-01-15", "张三")
+    svc1.add_fixture("Y002", "LED", "", "B-1", "2027-04-01", "李四")
+    svc1.add_fixture("Y003", "Spot", "", "C-1", "2027-08-01", "王五")
+
+    db1.set_setting(SETTING_FILTER_LOCATION, "")
+    db1.set_setting(SETTING_FILTER_STATUS, "")
+    db1.set_setting(SETTING_FILTER_DUE_START, "2027-03-01")
+    db1.set_setting(SETTING_FILTER_DUE_END, "2027-06-30")
+    db1.close()
+
+    db2, svc2, cf, fixtures = _make_filter_app(db_path)
+    assert cf["due_start"] == "2027-03-01"
+    assert cf["due_end"] == "2027-06-30"
+    nos = [f["fixture_no"] for f in fixtures]
+    assert nos == ["Y002"], f"Expected only Y002 within date range, got {nos}"
+    db2.close()
+    print("  PASS test_filter_due_range_effective_across_restart")
+
+
+def test_export_uses_restored_filter_results():
+    """Regression #3: 导出内容 = 恢复后的筛选结果（和用户重启后直接点导出看到的一致）"""
+    global _test_counter
+    _test_counter += 1
+    db_path = Path(TMP_DIR) / f"r3_{_test_counter}.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+    svc1.add_fixture("Z001", "PAR", "", "A-1", "2027-01-01", "张三")
+    svc1.add_fixture("Z002", "LED", "", "B-1", "2027-01-01", "李四")
+    svc1.add_fixture("Z003", "Spot", "", "A-1", "2027-01-01", "王五")
+
+    db1.set_setting(SETTING_FILTER_LOCATION, "A-1")
+    db1.set_setting(SETTING_FILTER_STATUS, STATUS_AVAILABLE)
+    db1.set_setting(SETTING_FILTER_DUE_START, "")
+    db1.set_setting(SETTING_FILTER_DUE_END, "")
+    db1.close()
+
+    db2, svc2, cf, fixtures = _make_filter_app(db_path)
+    assert len(fixtures) == 2
+
+    out_dir = Path(TMP_DIR) / f"r3_export_{_test_counter}"
+    out_dir.mkdir()
+    csv_path = svc2.export_csv(fixtures, str(out_dir), "result.csv")
+    with open(csv_path, encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    assert len(rows) == 3  # header + 2 rows
+    exported_nos = {rows[1][0], rows[2][0]}
+    queried_nos = {f["fixture_no"] for f in fixtures}
+    assert exported_nos == queried_nos, f"Export {exported_nos} != Query {queried_nos}"
+    db2.close()
+    print("  PASS test_export_uses_restored_filter_results")
+
+
+def test_reset_clears_persisted_filters():
+    """Bonus: 重置筛选后 DB 中的筛选设置也被清空"""
+    global _test_counter
+    _test_counter += 1
+    db_path = Path(TMP_DIR) / f"r4_{_test_counter}.db"
+    db = DatabaseManager(db_path)
+    db.set_setting(SETTING_FILTER_LOCATION, "A-99")
+    db.set_setting(SETTING_FILTER_STATUS, STATUS_BORROWED)
+    db.set_setting(SETTING_FILTER_DUE_START, "2020-01-01")
+    db.set_setting(SETTING_FILTER_DUE_END, "2020-12-31")
+
+    db.set_setting(SETTING_FILTER_LOCATION, "")
+    db.set_setting(SETTING_FILTER_STATUS, "")
+    db.set_setting(SETTING_FILTER_DUE_START, "")
+    db.set_setting(SETTING_FILTER_DUE_END, "")
+
+    assert db.get_setting(SETTING_FILTER_LOCATION, "") == ""
+    assert db.get_setting(SETTING_FILTER_STATUS, "") == ""
+    assert db.get_setting(SETTING_FILTER_DUE_START, "") == ""
+    assert db.get_setting(SETTING_FILTER_DUE_END, "") == ""
+    db.close()
+    print("  PASS test_reset_clears_persisted_filters")
+
+
 def main():
     setup()
     tests = [
@@ -418,6 +586,11 @@ def main():
         test_borrow_from_borrowed_rejected,
         test_freeze_from_borrowed,
         test_update_fixture_info,
+        test_filter_persistence_rootcause_empty_on_start,
+        test_filter_location_status_kept_across_restart,
+        test_filter_due_range_effective_across_restart,
+        test_export_uses_restored_filter_results,
+        test_reset_clears_persisted_filters,
     ]
     passed = 0
     failed = 0

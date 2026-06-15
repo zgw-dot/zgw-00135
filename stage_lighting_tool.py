@@ -1145,8 +1145,9 @@ class PrecheckDialog(tk.Toplevel):
         btn_frame.pack(fill="x", pady=(10, 0))
 
         if summary[RESULT_ERROR] > 0:
-            ttk.Label(btn_frame, text=f"⚠️  存在 {summary[RESULT_ERROR]} 条错误，请修正后再导入", foreground="#c62828").pack(side="left")
+            ttk.Label(btn_frame, text=f"⚠️  存在 {summary[RESULT_ERROR]} 条错误，请输入操作人后点击下方按钮记录失败批次", foreground="#c62828").pack(side="left", padx=4)
             ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
+            ttk.Button(btn_frame, text="记录失败批次", command=self._ok, width=14).pack(side="right", padx=4)
         else:
             ttk.Button(btn_frame, text="确认导入", command=self._ok, width=12).pack(side="right", padx=4)
             ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
@@ -1921,7 +1922,9 @@ class Application(tk.Tk):
             messagebox.showerror("错误", "操作人不能为空")
             return
 
-        if not messagebox.askyesno(
+        has_precheck_errors = summary[RESULT_ERROR] > 0
+
+        if not has_precheck_errors and not messagebox.askyesno(
             "确认导入",
             f"即将导入 {Path(filepath).name}\n\n"
             f"共 {summary['total']} 条记录:\n"

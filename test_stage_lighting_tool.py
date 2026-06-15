@@ -1431,6 +1431,130 @@ def test_successful_import_unaffected_by_failed_batch():
     print("  PASS test_successful_import_unaffected_by_failed_batch")
 
 
+def test_gui_flow_failed_import_records_batch():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "gui_flow_fail"
+    out_dir.mkdir()
+
+    fid = svc.add_fixture("GUI-SCRAP", "Old", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废")
+
+    rows = [
+        ["", "PAR64", "", "A-01", "bad-date", "", "无效状态", ""],
+        ["GUI-DUP", "LED", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["GUI-DUP", "LED2", "", "A-03", "2027-01-01", "王五", "", ""],
+        ["GUI-SCRAP", "New", "", "A-01", "2027-01-01", "赵六", "", ""],
+        ["GUI-NOMODEL", "", "", "A-04", "2027-01-01", "钱七", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+
+    assert summary[RESULT_ERROR] > 0
+    dlg_result = {"operator": "GUI操作员"}
+    assert dlg_result is not None, "Simulates user clicking '记录失败批次'"
+    operator = dlg_result.get("operator", "").strip()
+    assert operator
+
+    has_precheck_errors = summary[RESULT_ERROR] > 0
+    assert has_precheck_errors, "Simulates skipping askyesno for error case"
+
+    batch_id = None
+    batch_no = None
+    try:
+        result = svc.execute_import(str(filepath), operator, Path(filepath).name)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        batch_no = getattr(e, 'batch_no', None)
+        assert batch_id is not None, "Failed batch must have batch_id on exception"
+        assert batch_no is not None, "Failed batch must have batch_no on exception"
+        assert "预检发现错误" in str(e)
+        assert batch_no in str(e)
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["status"] == "failed"
+    assert batches[0]["operator"] == "GUI操作员"
+    assert batches[0]["error_count"] >= 4
+
+    detail = svc.get_import_batch_detail(batch_id)
+    items = detail["items"]
+    result_set = {it["result"] for it in items}
+    assert RESULT_ERROR in result_set
+    error_count_in_items = sum(1 for it in items if it["result"] == RESULT_ERROR)
+    assert error_count_in_items >= 4
+
+    export_dir = Path(TMP_DIR) / "gui_flow_fail_export"
+    export_dir.mkdir()
+    path = svc.export_batch_errors(batch_id, str(export_dir), "gui_errors.csv")
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        exported_rows = list(reader)
+    assert exported_rows[0] == ["行号", "灯具编号", "结果", "错误信息"]
+
+    error_items_precheck = [r for r in precheck_results if r["result"] == RESULT_ERROR]
+    exported_error_rows = [r for r in exported_rows[1:] if r[2] == RESULT_ERROR]
+    assert len(exported_error_rows) == len(error_items_precheck), \
+        f"Export error rows {len(exported_error_rows)} != precheck error rows {len(error_items_precheck)}"
+
+    exported_by_no = {r[1]: r[3] for r in exported_error_rows}
+    for pr in error_items_precheck:
+        fno = pr["fixture_no"]
+        assert fno in exported_by_no, f"Precheck error for {fno} missing from export"
+        for err in pr["errors"]:
+            assert err in exported_by_no[fno], \
+                f"Precheck error '{err}' missing from export for {fno}: '{exported_by_no[fno]}'"
+
+    try:
+        svc.rollback_batch(batch_id, "回滚员")
+        assert False, "Should have blocked rollback of failed batch"
+    except ValueError as e:
+        assert "无法回滚" in str(e)
+
+    db.close()
+    print("  PASS test_gui_flow_failed_import_records_batch")
+
+
+def test_gui_flow_successful_import_unaffected():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "gui_flow_success"
+    out_dir.mkdir()
+
+    rows = [
+        ["GUI-OK1", "PAR64", "灯钩x1", "A-01", "2027-01-01", "张三", "", ""],
+        ["GUI-OK2", "LED200", "灯钩x1", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    assert summary[RESULT_ERROR] == 0
+    assert summary[RESULT_NEW] == 2
+
+    dlg_result = {"operator": "GUI成功操作员"}
+    operator = dlg_result.get("operator", "").strip()
+    assert operator
+
+    has_precheck_errors = summary[RESULT_ERROR] > 0
+    assert not has_precheck_errors, "Simulates passing askyesno for success case"
+    confirm_import = True
+    assert confirm_import
+
+    result = svc.execute_import(str(filepath), operator, Path(filepath).name)
+    assert result["summary"]["new"] == 2
+    assert result["summary"]["error"] == 0
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["status"] == "completed"
+    assert batches[0]["operator"] == "GUI成功操作员"
+
+    db.close()
+    print("  PASS test_gui_flow_successful_import_unaffected")
+
+
 def main():
     setup()
     tests = [
@@ -1489,6 +1613,8 @@ def main():
         test_failed_import_persistence_across_restart,
         test_failed_import_error_export_matches_precheck,
         test_successful_import_unaffected_by_failed_batch,
+        test_gui_flow_failed_import_records_batch,
+        test_gui_flow_successful_import_unaffected,
     ]
     passed = 0
     failed = 0

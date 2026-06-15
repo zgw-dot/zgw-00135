@@ -153,6 +153,39 @@ class DatabaseManager:
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS import_draft_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_no TEXT UNIQUE NOT NULL,
+                operator TEXT NOT NULL DEFAULT '',
+                source_file TEXT NOT NULL DEFAULT '',
+                source_file_hash TEXT NOT NULL DEFAULT '',
+                filter_conditions TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                record_count INTEGER NOT NULL DEFAULT 0,
+                new_count INTEGER NOT NULL DEFAULT 0,
+                update_count INTEGER NOT NULL DEFAULT 0,
+                skip_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS import_draft_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id INTEGER NOT NULL,
+                fixture_no TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                result TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                before_snapshot TEXT NOT NULL DEFAULT '',
+                after_snapshot TEXT NOT NULL DEFAULT '',
+                record_data TEXT NOT NULL DEFAULT '',
+                selected INTEGER NOT NULL DEFAULT 1,
+                conflict_type TEXT NOT NULL DEFAULT '',
+                conflict_detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_fixtures_status ON fixtures(status);
             CREATE INDEX IF NOT EXISTS idx_fixtures_location ON fixtures(location);
             CREATE INDEX IF NOT EXISTS idx_fixtures_inspection ON fixtures(inspection_due_date);
@@ -160,6 +193,9 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_import_batches_no ON import_batches(batch_no);
             CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_batch_items(batch_id);
             CREATE INDEX IF NOT EXISTS idx_import_items_fno ON import_batch_items(fixture_no);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_no ON import_draft_batches(draft_no);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_items_draft ON import_draft_items(draft_id);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_items_fno ON import_draft_items(fixture_no);
         """)
         self.conn.commit()
 
@@ -312,6 +348,77 @@ class DatabaseManager:
         self.execute("DELETE FROM import_batch_items WHERE batch_id=?", (batch_id,))
         self.execute("DELETE FROM import_batches WHERE id=?", (batch_id,))
         self.commit()
+
+    def create_draft_batch(self, draft_no, operator, source_file, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count):
+        cur = self.execute(
+            "INSERT INTO import_draft_batches (draft_no, operator, source_file, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count, status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')",
+            (draft_no, operator, source_file, source_file_hash, filter_conditions or "", remark or "", record_count, new_count, update_count, skip_count, error_count),
+        )
+        return cur.lastrowid
+
+    def update_draft_batch(self, draft_id, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [draft_id]
+        self.execute(f"UPDATE import_draft_batches SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+        self.commit()
+
+    def get_draft_batches(self):
+        rows = self.execute("SELECT * FROM import_draft_batches WHERE status='draft' ORDER BY updated_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_draft_batch(self, draft_id):
+        row = self.execute("SELECT * FROM import_draft_batches WHERE id=?", (draft_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_draft_batch_by_no(self, draft_no):
+        row = self.execute("SELECT * FROM import_draft_batches WHERE draft_no=?", (draft_no,)).fetchone()
+        return dict(row) if row else None
+
+    def add_draft_item(self, draft_id, fixture_no, row_index, result, error_message="", before_snapshot="", after_snapshot="", record_data="", selected=1, conflict_type="", conflict_detail=""):
+        cur = self.execute(
+            "INSERT INTO import_draft_items (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, selected, conflict_type, conflict_detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, 1 if selected else 0, conflict_type, conflict_detail),
+        )
+        return cur.lastrowid
+
+    def update_draft_item(self, item_id, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [item_id]
+        self.execute(f"UPDATE import_draft_items SET {sets} WHERE id=?", vals)
+        self.commit()
+
+    def get_draft_items(self, draft_id):
+        rows = self.execute("SELECT * FROM import_draft_items WHERE draft_id=? ORDER BY row_index", (draft_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_selected_draft_items(self, draft_id):
+        rows = self.execute("SELECT * FROM import_draft_items WHERE draft_id=? AND selected=1 ORDER BY row_index", (draft_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_draft_item_selected(self, item_id, selected):
+        self.execute("UPDATE import_draft_items SET selected=? WHERE id=?", (1 if selected else 0, item_id))
+        self.commit()
+
+    def set_all_draft_items_selected(self, draft_id, selected):
+        self.execute("UPDATE import_draft_items SET selected=? WHERE draft_id=?", (1 if selected else 0, draft_id))
+        self.commit()
+
+    def set_draft_items_selected_by_result(self, draft_id, result, selected):
+        self.execute("UPDATE import_draft_items SET selected=? WHERE draft_id=? AND result=?", (1 if selected else 0, draft_id, result))
+        self.commit()
+
+    def delete_draft_batch(self, draft_id):
+        self.execute("DELETE FROM import_draft_items WHERE draft_id=?", (draft_id,))
+        self.execute("DELETE FROM import_draft_batches WHERE id=?", (draft_id,))
+        self.commit()
+
+    def count_draft_items_by_result(self, draft_id):
+        rows = self.execute("SELECT result, COUNT(*) as cnt, SUM(selected) as sel_cnt FROM import_draft_items WHERE draft_id=? GROUP BY result", (draft_id,)).fetchall()
+        return {r["result"]: {"total": r["cnt"], "selected": r["sel_cnt"]} for r in rows}
 
     def begin_transaction(self):
         self.execute("BEGIN IMMEDIATE")
@@ -1006,6 +1113,344 @@ class LightingService:
             raise ValueError(f"不支持的格式: {fmt}")
         return str(filepath)
 
+    def _compute_file_hash(self, filepath):
+        import hashlib
+        try:
+            h = hashlib.md5()
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def create_draft_from_precheck(self, filepath, operator, precheck_results, summary, filter_conditions=None, remark=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        source_name = Path(filepath).name
+        file_hash = self._compute_file_hash(filepath)
+        filter_json = json.dumps(filter_conditions or {}, ensure_ascii=False)
+
+        draft_no = f"DFT{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
+
+        self.db.begin_transaction()
+        try:
+            draft_id = self.db.create_draft_batch(
+                draft_no, operator, source_name, file_hash, filter_json, remark,
+                summary["total"],
+                summary.get(RESULT_NEW, 0),
+                summary.get(RESULT_UPDATE, 0),
+                summary.get(RESULT_SKIP, 0),
+                summary.get(RESULT_ERROR, 0),
+            )
+
+            for pr in precheck_results:
+                row_idx = pr["row"]
+                fixture_no = pr["fixture_no"]
+                result = pr["result"]
+                error_msg = "; ".join(pr["errors"]) if pr["errors"] else ""
+                before_snap = json.dumps(pr["before"], ensure_ascii=False) if pr["before"] else ""
+                after_snap = json.dumps(pr["after"], ensure_ascii=False) if pr["after"] else ""
+                record_data = json.dumps(pr.get("record", {}), ensure_ascii=False)
+                selected = 1 if result in (RESULT_NEW, RESULT_UPDATE) else 0
+
+                self.db.add_draft_item(
+                    draft_id, fixture_no, row_idx, result, error_msg,
+                    before_snap, after_snap, record_data, selected, "", ""
+                )
+
+            self.db.commit()
+            return {"draft_id": draft_id, "draft_no": draft_no}
+        except Exception:
+            self.db.rollback_transaction()
+            raise
+
+    def get_draft_batches(self):
+        return self.db.get_draft_batches()
+
+    def get_draft_detail(self, draft_id):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            return None
+        items = self.db.get_draft_items(draft_id)
+        for item in items:
+            if item["before_snapshot"]:
+                item["before_obj"] = json.loads(item["before_snapshot"])
+            else:
+                item["before_obj"] = None
+            if item["after_snapshot"]:
+                item["after_obj"] = json.loads(item["after_snapshot"])
+            else:
+                item["after_obj"] = None
+            if item["record_data"]:
+                item["record_obj"] = json.loads(item["record_data"])
+            else:
+                item["record_obj"] = None
+        return {"draft": draft, "items": items}
+
+    def update_draft_remark(self, draft_id, remark):
+        self.db.update_draft_batch(draft_id, remark=remark or "")
+
+    def set_draft_item_selected(self, item_id, selected):
+        self.db.set_draft_item_selected(item_id, selected)
+
+    def set_all_draft_items_selected(self, draft_id, selected):
+        self.db.set_all_draft_items_selected(draft_id, selected)
+
+    def set_draft_items_selected_by_result(self, draft_id, result, selected):
+        self.db.set_draft_items_selected_by_result(draft_id, result, selected)
+
+    def delete_draft(self, draft_id):
+        self.db.delete_draft_batch(draft_id)
+
+    def _detect_draft_conflicts(self, draft_id, filepath=None):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+
+        items = self.db.get_selected_draft_items(draft_id)
+        conflicts = []
+
+        if filepath and draft["source_file_hash"]:
+            current_hash = self._compute_file_hash(filepath)
+            if current_hash and current_hash != draft["source_file_hash"]:
+                conflicts.append({
+                    "type": "file_changed",
+                    "fixture_no": "",
+                    "item_id": None,
+                    "detail": f"源文件内容已变化（原哈希: {draft['source_file_hash'][:8]}..., 当前: {current_hash[:8]}...），草稿数据可能已过时",
+                })
+
+        for item in items:
+            if item["result"] not in (RESULT_NEW, RESULT_UPDATE):
+                continue
+
+            fixture_no = item["fixture_no"]
+            current = self.db.get_fixture_by_no(fixture_no)
+
+            if item["result"] == RESULT_NEW:
+                if current:
+                    conflicts.append({
+                        "type": "new_conflict",
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "detail": f"灯具已存在（当前状态: {current['status']}），不能再新增",
+                    })
+                    continue
+
+            elif item["result"] == RESULT_UPDATE:
+                if not current:
+                    conflicts.append({
+                        "type": "update_conflict_deleted",
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "detail": "灯具已被删除，无法更新",
+                    })
+                    continue
+
+                if item["before_snapshot"]:
+                    before = json.loads(item["before_snapshot"])
+                    changed_fields = []
+                    for field in ["status", "model", "accessories", "location", "inspection_due_date", "person_in_charge"]:
+                        old_val = before.get(field, "")
+                        cur_val = current.get(field, "")
+                        if old_val != cur_val:
+                            changed_fields.append(f"{field}: {old_val} → {cur_val}")
+                    if changed_fields:
+                        conflicts.append({
+                            "type": "update_conflict_changed",
+                            "fixture_no": fixture_no,
+                            "item_id": item["id"],
+                            "detail": f"灯具数据已变化: {'; '.join(changed_fields)}",
+                        })
+                        continue
+
+                latest_batch = self.db.get_latest_batch_for_fixture(fixture_no)
+                if latest_batch:
+                    draft_created = draft["created_at"]
+                    batch_created = latest_batch.get("created_at", "")
+                    if batch_created and batch_created > draft_created:
+                        conflicts.append({
+                            "type": "other_batch_conflict",
+                            "fixture_no": fixture_no,
+                            "item_id": item["id"],
+                            "detail": f"已被批次 {latest_batch['batch_no']}（{batch_created}）修改过",
+                        })
+
+        return conflicts
+
+    def submit_draft(self, draft_id, operator, filepath=None):
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+        if draft["status"] != "draft":
+            raise ValueError(f"草稿状态为「{draft['status']}」，无法提交")
+
+        conflicts = self._detect_draft_conflicts(draft_id, filepath)
+        if conflicts:
+            conflict_msgs = []
+            for c in conflicts:
+                if c["fixture_no"]:
+                    conflict_msgs.append(f"{c['fixture_no']}: {c['detail']}")
+                else:
+                    conflict_msgs.append(c["detail"])
+            err = ValueError("提交前检测到冲突:\n" + "\n".join(conflict_msgs))
+            err.conflicts = conflicts
+            raise err
+
+        selected_items = self.db.get_selected_draft_items(draft_id)
+        if not selected_items:
+            raise ValueError("没有选中的记录可提交")
+
+        error_items = [it for it in selected_items if it["result"] == RESULT_ERROR]
+        if error_items:
+            raise ValueError(f"选中的记录中有 {len(error_items)} 条错误记录，请先取消选中或修正后再提交")
+
+        batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
+        source_name = draft["source_file"]
+
+        self.db.begin_transaction()
+        try:
+            batch_id = self.db.create_import_batch(batch_no, operator, source_name, len(selected_items))
+
+            counts = {RESULT_NEW: 0, RESULT_UPDATE: 0, RESULT_SKIP: 0, RESULT_ERROR: 0}
+
+            for item in selected_items:
+                fixture_no = item["fixture_no"]
+                result = item["result"]
+                row_idx = item["row_index"]
+
+                before = json.loads(item["before_snapshot"]) if item["before_snapshot"] else None
+                after_obj = json.loads(item["after_snapshot"]) if item["after_snapshot"] else None
+                record = json.loads(item["record_data"]) if item["record_data"] else {}
+
+                before_snap = item["before_snapshot"]
+                after_snap = ""
+                error_msg = ""
+
+                if result == RESULT_NEW:
+                    status_val = (after_obj.get("status") if after_obj else None) or STATUS_AVAILABLE
+                    fid = self.db.execute(
+                        "INSERT INTO fixtures (fixture_no,model,accessories,location,inspection_due_date,person_in_charge,status,last_remark) VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            fixture_no,
+                            after_obj.get("model", "") if after_obj else "",
+                            after_obj.get("accessories", "") if after_obj else "",
+                            after_obj.get("location", "") if after_obj else "",
+                            after_obj.get("inspection_due_date", "") if after_obj else "",
+                            after_obj.get("person_in_charge", "") if after_obj else "",
+                            status_val,
+                            after_obj.get("last_remark", f"批量导入，批次 {batch_no}") if after_obj else f"批量导入，批次 {batch_no}",
+                        ),
+                    ).lastrowid
+                    self.db.execute(
+                        "INSERT INTO history (fixture_id,action,from_status,to_status,operator,remark) VALUES (?,?,?,?,?,?)",
+                        (fid, "批量导入", "", status_val, operator, f"批次 {batch_no}"),
+                    )
+                    new_f = self.db.execute("SELECT * FROM fixtures WHERE id=?", (fid,)).fetchone()
+                    after_snap = json.dumps(dict(new_f), ensure_ascii=False)
+                    counts[RESULT_NEW] += 1
+
+                elif result == RESULT_UPDATE:
+                    fid = before["id"]
+                    old_status = before["status"]
+                    updates = {}
+                    for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status", "last_remark"]:
+                        new_val = after_obj.get(field, "") if after_obj else ""
+                        old_val = before.get(field, "")
+                        if field == "status" and not new_val:
+                            continue
+                        if new_val and new_val != old_val:
+                            updates[field] = new_val
+
+                    if updates:
+                        sets = ", ".join(f"{k}=?" for k in updates)
+                        vals = list(updates.values()) + [fid]
+                        self.db.execute(f"UPDATE fixtures SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+                        new_status = updates.get("status", old_status)
+                        self.db.execute(
+                            "INSERT INTO history (fixture_id,action,from_status,to_status,operator,remark) VALUES (?,?,?,?,?,?)",
+                            (fid, "批量更新", old_status, new_status, operator, f"批次 {batch_no}"),
+                        )
+                    new_f = self.db.execute("SELECT * FROM fixtures WHERE id=?", (fid,)).fetchone()
+                    after_snap = json.dumps(dict(new_f), ensure_ascii=False)
+                    counts[RESULT_UPDATE] += 1
+
+                elif result == RESULT_SKIP:
+                    after_snap = before_snap
+                    counts[RESULT_SKIP] += 1
+
+                self.db.add_import_batch_item(
+                    batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
+                )
+
+            self.db.update_import_batch_counts(
+                batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
+            )
+            self.db.update_import_batch_status(batch_id, "completed")
+
+            self.db.update_draft_batch(draft_id, status="submitted")
+
+            self.db.commit()
+
+            return {
+                "batch_id": batch_id,
+                "batch_no": batch_no,
+                "summary": {
+                    "total": len(selected_items),
+                    "new": counts[RESULT_NEW],
+                    "update": counts[RESULT_UPDATE],
+                    "skip": counts[RESULT_SKIP],
+                    "error": counts[RESULT_ERROR],
+                },
+            }
+
+        except Exception as e:
+            self.db.rollback_transaction()
+            raise
+
+    def export_draft_items(self, draft_id, directory, filename, selected_only=False):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+
+        if selected_only:
+            items = self.db.get_selected_draft_items(draft_id)
+        else:
+            items = self.db.get_draft_items(draft_id)
+
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["行号", "灯具编号", "结果", "是否选中", "信息", "变更详情"])
+            for item in items:
+                detail_parts = []
+                if item["before_snapshot"] and item["after_snapshot"]:
+                    before = json.loads(item["before_snapshot"])
+                    after = json.loads(item["after_snapshot"])
+                    for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                        old_val = before.get(field, "")
+                        new_val = after.get(field, "")
+                        if field == "status" and not new_val:
+                            continue
+                        if new_val and new_val != old_val:
+                            detail_parts.append(f"{field}: {old_val} → {new_val}")
+                detail = "; ".join(detail_parts)
+                selected_str = "是" if item["selected"] else "否"
+                msg = item["error_message"] or (item["result"] == RESULT_NEW and "新增") or (item["result"] == RESULT_UPDATE and "更新") or (item["result"] == RESULT_SKIP and "跳过（无变化）") or ""
+                writer.writerow([item["row_index"], item["fixture_no"], item["result"], selected_str, msg, detail])
+        return str(filepath)
+
 
 class FormDialog(tk.Toplevel):
     def __init__(self, parent, title, fields, initial=None, width=360):
@@ -1066,6 +1511,7 @@ class PrecheckDialog(tk.Toplevel):
         self.result = None
         self.precheck_results = precheck_results
         self.summary = summary
+        self.filepath = filepath
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
@@ -1140,24 +1586,36 @@ class PrecheckDialog(tk.Toplevel):
         ttk.Label(op_frame, text="操作人:").pack(side="left", padx=(0, 4))
         self.operator_var = tk.StringVar()
         ttk.Entry(op_frame, textvariable=self.operator_var, width=20).pack(side="left")
+        ttk.Label(op_frame, text="  备注:").pack(side="left", padx=(8, 4))
+        self.remark_var = tk.StringVar()
+        ttk.Entry(op_frame, textvariable=self.remark_var, width=30).pack(side="left")
 
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill="x", pady=(10, 0))
 
         if summary[RESULT_ERROR] > 0:
-            ttk.Label(btn_frame, text=f"⚠️  存在 {summary[RESULT_ERROR]} 条错误，请输入操作人后点击下方按钮记录失败批次", foreground="#c62828").pack(side="left", padx=4)
-            ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
-            ttk.Button(btn_frame, text="记录失败批次", command=self._ok, width=14).pack(side="right", padx=4)
+            ttk.Label(btn_frame, text=f"⚠️  存在 {summary[RESULT_ERROR]} 条错误，可保存为草稿后续处理", foreground="#c62828").pack(side="left", padx=4)
+            ttk.Button(btn_frame, text="取消", command=self._cancel, width=10).pack(side="right")
+            ttk.Button(btn_frame, text="保存为草稿", command=self._on_save_draft, width=12).pack(side="right", padx=4)
         else:
-            ttk.Button(btn_frame, text="确认导入", command=self._ok, width=12).pack(side="right", padx=4)
-            ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
+            ttk.Button(btn_frame, text="取消", command=self._cancel, width=10).pack(side="right")
+            ttk.Button(btn_frame, text="直接导入", command=self._ok, width=10).pack(side="right", padx=4)
+            ttk.Button(btn_frame, text="保存为草稿", command=self._on_save_draft, width=12).pack(side="right", padx=4)
 
         self.geometry("800x600")
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.wait_window()
 
     def _ok(self):
-        self.result = {"operator": self.operator_var.get().strip()}
+        self.result = {"action": "import", "operator": self.operator_var.get().strip()}
+        self.destroy()
+
+    def _on_save_draft(self):
+        self.result = {
+            "action": "save_draft",
+            "operator": self.operator_var.get().strip(),
+            "remark": self.remark_var.get().strip(),
+        }
         self.destroy()
 
     def _cancel(self):
@@ -1337,6 +1795,378 @@ class BatchHistoryDialog(tk.Toplevel):
         self.destroy()
 
 
+class DraftListDialog(tk.Toplevel):
+    def __init__(self, parent, service):
+        super().__init__(parent)
+        self.title("导入草稿批次")
+        self.result = None
+        self.service = service
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        cols = ("draft_no", "created_at", "updated_at", "operator", "source_file",
+                "total", "new_count", "update_count", "skip_count", "error_count", "remark")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=12)
+        headers = [
+            ("draft_no", "草稿号", 140),
+            ("created_at", "创建时间", 140),
+            ("updated_at", "更新时间", 140),
+            ("operator", "操作人", 80),
+            ("source_file", "来源文件", 160),
+            ("total", "总数", 50),
+            ("new_count", "新增", 50),
+            ("update_count", "更新", 50),
+            ("skip_count", "跳过", 50),
+            ("error_count", "错误", 50),
+            ("remark", "备注", 200),
+        ]
+        for col_id, col_name, col_w in headers:
+            self.tree.heading(col_id, text=col_name, anchor="center")
+            self.tree.column(col_id, width=col_w, anchor="center")
+
+        self._refresh_drafts()
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_draft)
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(btn_frame, text="新建草稿...", command=self._on_new, width=14).pack(side="left", padx=4)
+        self.btn_edit = ttk.Button(btn_frame, text="编辑草稿", command=self._on_edit, width=12, state="disabled")
+        self.btn_edit.pack(side="left", padx=4)
+        self.btn_submit = ttk.Button(btn_frame, text="提交选中", command=self._on_submit, width=12, state="disabled")
+        self.btn_submit.pack(side="left", padx=4)
+        self.btn_delete = ttk.Button(btn_frame, text="删除草稿", command=self._on_delete, width=12, state="disabled")
+        self.btn_delete.pack(side="left", padx=4)
+        self.btn_export = ttk.Button(btn_frame, text="导出明细", command=self._on_export, width=12, state="disabled")
+        self.btn_export.pack(side="left", padx=4)
+
+        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=12).pack(side="right")
+
+        self.geometry("1050x550")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _refresh_drafts(self):
+        self.tree.delete(*self.tree.get_children())
+        drafts = self.service.get_draft_batches()
+        for d in drafts:
+            self.tree.insert("", "end", iid=str(d["id"]), values=(
+                d["draft_no"], d["created_at"], d["updated_at"],
+                d["operator"], d["source_file"],
+                d["record_count"], d["new_count"], d["update_count"],
+                d["skip_count"], d["error_count"], d["remark"]
+            ))
+
+    def _on_select_draft(self, event=None):
+        sel = self.tree.selection()
+        has_sel = bool(sel)
+        self.btn_edit.config(state="normal" if has_sel else "disabled")
+        self.btn_submit.config(state="normal" if has_sel else "disabled")
+        self.btn_delete.config(state="normal" if has_sel else "disabled")
+        self.btn_export.config(state="normal" if has_sel else "disabled")
+
+    def _on_new(self):
+        self.result = {"action": "new"}
+        self.destroy()
+
+    def _on_edit(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        self.result = {"action": "edit", "draft_id": draft_id}
+        self.destroy()
+
+    def _on_submit(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        self.result = {"action": "submit", "draft_id": draft_id}
+        self.destroy()
+
+    def _on_delete(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        draft = self.service.db.get_draft_batch(draft_id)
+        if not draft:
+            return
+        if not messagebox.askyesno("确认删除", f"确定要删除草稿 {draft['draft_no']} 吗？\n删除后不可恢复。"):
+            return
+        try:
+            self.service.delete_draft(draft_id)
+            self._refresh_drafts()
+            messagebox.showinfo("成功", "草稿已删除")
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e))
+
+    def _on_export(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        self.result = {"action": "export", "draft_id": draft_id}
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class DraftEditDialog(tk.Toplevel):
+    def __init__(self, parent, service, draft_id, source_filepath=None):
+        super().__init__(parent)
+        self.title("编辑导入草稿")
+        self.result = None
+        self.service = service
+        self.draft_id = draft_id
+        self.source_filepath = source_filepath
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.detail = self.service.get_draft_detail(draft_id)
+        if not self.detail:
+            messagebox.showerror("错误", "草稿不存在")
+            self.destroy()
+            return
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        info_frame = ttk.LabelFrame(main, text="草稿信息", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+
+        draft = self.detail["draft"]
+        info_text = (
+            f"草稿号: {draft['draft_no']}    "
+            f"操作人: {draft['operator']}    "
+            f"来源文件: {draft['source_file']}\n"
+            f"创建时间: {draft['created_at']}    "
+            f"更新时间: {draft['updated_at']}"
+        )
+        ttk.Label(info_frame, text=info_text, justify="left").pack(anchor="w")
+
+        remark_frame = ttk.Frame(info_frame)
+        remark_frame.pack(fill="x", pady=(6, 0))
+        ttk.Label(remark_frame, text="备注:").pack(side="left", padx=(0, 4))
+        self.remark_var = tk.StringVar(value=draft.get("remark", ""))
+        self.remark_entry = ttk.Entry(remark_frame, textvariable=self.remark_var, width=60)
+        self.remark_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(remark_frame, text="保存备注", command=self._on_save_remark, width=10).pack(side="left", padx=8)
+
+        filter_frame = ttk.LabelFrame(main, text="快捷选择", padding=8)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(filter_frame, text="全选", command=lambda: self._set_all_selected(True), width=8).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text="全不选", command=lambda: self._set_all_selected(False), width=8).pack(side="left", padx=2)
+        ttk.Separator(filter_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(filter_frame, text="按结果类型:").pack(side="left", padx=(0, 4))
+        ttk.Button(filter_frame, text=f"选全部新增", command=lambda: self._set_by_result(RESULT_NEW, True), width=10).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text=f"取消新增", command=lambda: self._set_by_result(RESULT_NEW, False), width=10).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text=f"选全部更新", command=lambda: self._set_by_result(RESULT_UPDATE, True), width=10).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text=f"取消更新", command=lambda: self._set_by_result(RESULT_UPDATE, False), width=10).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text=f"选全部跳过", command=lambda: self._set_by_result(RESULT_SKIP, True), width=10).pack(side="left", padx=2)
+        ttk.Button(filter_frame, text=f"取消跳过", command=lambda: self._set_by_result(RESULT_SKIP, False), width=10).pack(side="left", padx=2)
+
+        cols = ("selected", "row", "fixture_no", "result", "detail")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=18)
+        self.tree.heading("selected", text="选中", anchor="center")
+        self.tree.heading("row", text="行号", anchor="center")
+        self.tree.heading("fixture_no", text="灯具编号", anchor="center")
+        self.tree.heading("result", text="结果", anchor="center")
+        self.tree.heading("detail", text="详情", anchor="w")
+        self.tree.column("selected", width=50, anchor="center")
+        self.tree.column("row", width=60, anchor="center")
+        self.tree.column("fixture_no", width=100, anchor="center")
+        self.tree.column("result", width=80, anchor="center")
+        self.tree.column("detail", width=520, anchor="w")
+
+        result_tags = {
+            RESULT_NEW: ("new", "#1565c0"),
+            RESULT_UPDATE: ("update", "#2e7d32"),
+            RESULT_SKIP: ("skip", "#f57f17"),
+            RESULT_ERROR: ("error", "#c62828"),
+        }
+        for tag, color in result_tags.values():
+            self.tree.tag_configure(tag, foreground=color)
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self._refresh_items()
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        self.summary_label = ttk.Label(btn_frame, text="")
+        self.summary_label.pack(side="left", padx=4)
+
+        ttk.Button(btn_frame, text="检测冲突", command=self._on_check_conflicts, width=12).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="提交选中记录", command=self._on_submit, width=14).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=10).pack(side="right")
+
+        self._update_summary()
+
+        self.geometry("950x700")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _refresh_items(self):
+        self.tree.delete(*self.tree.get_children())
+        self.detail = self.service.get_draft_detail(self.draft_id)
+        items = self.detail["items"]
+        for item in items:
+            selected_str = "☑" if item["selected"] else "☐"
+            detail_parts = []
+            if item["result"] == RESULT_ERROR:
+                detail_parts.append("错误: " + item["error_message"])
+            elif item["result"] == RESULT_NEW:
+                detail_parts.append("将新增")
+            elif item["result"] == RESULT_UPDATE:
+                changes = []
+                before = item["before_obj"] or {}
+                after = item["after_obj"] or {}
+                for f in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                    old = before.get(f, "")
+                    new = after.get(f, "")
+                    if f == "status" and not new:
+                        continue
+                    if new and new != old:
+                        changes.append(f"{f}: {old} → {new}")
+                detail_parts.append("更新: " + "; ".join(changes))
+            elif item["result"] == RESULT_SKIP:
+                detail_parts.append("数据无变化")
+            detail = " | ".join(detail_parts)
+            tag_name = item["result"]
+            self.tree.insert("", "end", iid=str(item["id"]),
+                             values=(selected_str, item["row_index"], item["fixture_no"], item["result"], detail),
+                             tags=(tag_name,))
+
+    def _update_summary(self):
+        counts = self.service.db.count_draft_items_by_result(self.draft_id)
+        total_sel = sum(c["selected"] for c in counts.values())
+        total_all = sum(c["total"] for c in counts.values())
+        text = f"总计 {total_all} 条，已选中 {total_sel} 条"
+        parts = []
+        for r in [RESULT_NEW, RESULT_UPDATE, RESULT_SKIP, RESULT_ERROR]:
+            c = counts.get(r, {"total": 0, "selected": 0})
+            if c["total"] > 0:
+                parts.append(f"{r}: {c['selected']}/{c['total']}")
+        if parts:
+            text += " （" + "  ".join(parts) + "）"
+        self.summary_label.config(text=text)
+
+    def _on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        if col != "#1":
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        item_id = int(row_id)
+        item = self.service.db.execute("SELECT selected FROM import_draft_items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            return
+        new_selected = 0 if item["selected"] else 1
+        self.service.set_draft_item_selected(item_id, new_selected)
+        self._refresh_items()
+        self._update_summary()
+
+    def _set_all_selected(self, selected):
+        self.service.set_all_draft_items_selected(self.draft_id, selected)
+        self._refresh_items()
+        self._update_summary()
+
+    def _set_by_result(self, result, selected):
+        self.service.set_draft_items_selected_by_result(self.draft_id, result, selected)
+        self._refresh_items()
+        self._update_summary()
+
+    def _on_save_remark(self):
+        remark = self.remark_var.get().strip()
+        try:
+            self.service.update_draft_remark(self.draft_id, remark)
+            messagebox.showinfo("成功", "备注已保存")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+
+    def _on_check_conflicts(self):
+        try:
+            conflicts = self.service._detect_draft_conflicts(self.draft_id, self.source_filepath)
+            if not conflicts:
+                messagebox.showinfo("冲突检测", "未检测到冲突，选中的记录可以安全提交")
+            else:
+                conflict_msgs = []
+                for c in conflicts:
+                    if c["fixture_no"]:
+                        conflict_msgs.append(f"{c['fixture_no']}: {c['detail']}")
+                    else:
+                        conflict_msgs.append(c["detail"])
+                messagebox.showwarning("检测到冲突",
+                                       f"发现 {len(conflicts)} 个冲突:\n\n" + "\n".join(conflict_msgs) +
+                                       "\n\n请处理冲突后再提交。")
+        except Exception as e:
+            messagebox.showerror("检测失败", str(e))
+
+    def _on_submit(self):
+        selected = self.service.db.get_selected_draft_items(self.draft_id)
+        if not selected:
+            messagebox.showwarning("提示", "没有选中的记录可提交")
+            return
+        error_items = [it for it in selected if it["result"] == RESULT_ERROR]
+        if error_items:
+            messagebox.showerror("错误", f"选中的记录中有 {len(error_items)} 条错误记录，请先取消选中或修正后再提交")
+            return
+
+        if not messagebox.askyesno("确认提交",
+                                    f"确定要提交选中的 {len(selected)} 条记录吗？\n\n"
+                                    f"新增: {sum(1 for it in selected if it['result']==RESULT_NEW)} 条\n"
+                                    f"更新: {sum(1 for it in selected if it['result']==RESULT_UPDATE)} 条\n"
+                                    f"跳过: {sum(1 for it in selected if it['result']==RESULT_SKIP)} 条"):
+            return
+
+        fields = [("operator", "操作人", self.detail["draft"]["operator"])]
+        dlg = FormDialog(self, "提交草稿", fields)
+        if dlg.result is None:
+            return
+        operator = dlg.result.get("operator", "").strip()
+        if not operator:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+
+        try:
+            result = self.service.submit_draft(self.draft_id, operator, self.source_filepath)
+            self.result = {"action": "submitted", "batch_id": result["batch_id"], "batch_no": result["batch_no"], "summary": result["summary"]}
+            self.destroy()
+        except ValueError as e:
+            messagebox.showerror("提交失败", str(e))
+        except Exception as e:
+            messagebox.showerror("提交失败", f"提交时发生错误:\n{e}")
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class Application(tk.Tk):
     def __init__(self, service):
         super().__init__()
@@ -1411,6 +2241,7 @@ class Application(tk.Tk):
         action_menu.add_command(label="删除灯具", command=self._on_delete_fixture)
         action_menu.add_separator()
         action_menu.add_command(label="批量导入灯具台账...", command=self._on_batch_import)
+        action_menu.add_command(label="导入草稿批次...", command=self._on_draft_list)
         action_menu.add_command(label="导入批次历史...", command=self._on_batch_history)
         menubar.add_cascade(label="操作", menu=action_menu)
 
@@ -1917,50 +2748,154 @@ class Application(tk.Tk):
         if not dlg.result:
             return
 
+        action = dlg.result.get("action", "")
         operator = dlg.result.get("operator", "").strip()
         if not operator:
             messagebox.showerror("错误", "操作人不能为空")
             return
 
-        has_precheck_errors = summary[RESULT_ERROR] > 0
-
-        if not has_precheck_errors and not messagebox.askyesno(
-            "确认导入",
-            f"即将导入 {Path(filepath).name}\n\n"
-            f"共 {summary['total']} 条记录:\n"
-            f"  新增: {summary[RESULT_NEW]} 条\n"
-            f"  更新: {summary[RESULT_UPDATE]} 条\n"
-            f"  跳过: {summary[RESULT_SKIP]} 条\n"
-            f"  错误: {summary[RESULT_ERROR]} 条\n\n"
-            f"操作人: {operator}\n\n"
-            f"确认执行导入？",
-        ):
+        if action == "save_draft":
+            remark = dlg.result.get("remark", "").strip()
+            try:
+                result = self.service.create_draft_from_precheck(
+                    filepath, operator, precheck_results, summary,
+                    filter_conditions=self._current_filters, remark=remark
+                )
+                messagebox.showinfo("成功", f"草稿已保存！\n草稿号: {result['draft_no']}\n共 {summary['total']} 条记录\n\n可在「操作 → 导入草稿批次」中继续编辑和提交。")
+            except Exception as e:
+                messagebox.showerror("保存草稿失败", str(e))
             return
 
-        try:
-            result = self.service.execute_import(filepath, operator, Path(filepath).name)
+        if action == "import":
+            has_precheck_errors = summary[RESULT_ERROR] > 0
+
+            if not has_precheck_errors and not messagebox.askyesno(
+                "确认导入",
+                f"即将导入 {Path(filepath).name}\n\n"
+                f"共 {summary['total']} 条记录:\n"
+                f"  新增: {summary[RESULT_NEW]} 条\n"
+                f"  更新: {summary[RESULT_UPDATE]} 条\n"
+                f"  跳过: {summary[RESULT_SKIP]} 条\n"
+                f"  错误: {summary[RESULT_ERROR]} 条\n\n"
+                f"操作人: {operator}\n\n"
+                f"确认执行导入？",
+            ):
+                return
+
+            try:
+                result = self.service.execute_import(filepath, operator, Path(filepath).name)
+                self._refresh_table()
+                msg = (f"导入成功！批次号: {result['batch_no']}\n\n"
+                       f"共 {result['summary']['total']} 条:\n"
+                       f"  新增: {result['summary']['new']} 条\n"
+                       f"  更新: {result['summary']['update']} 条\n"
+                       f"  跳过: {result['summary']['skip']} 条\n"
+                       f"  错误: {result['summary']['error']} 条")
+                if result['summary']['error'] > 0:
+                    if messagebox.askyesno("导入完成（有错误）", msg + "\n\n是否导出错误清单？"):
+                        self._do_export_batch_errors(result['batch_id'])
+                else:
+                    messagebox.showinfo("导入成功", msg)
+            except ValueError as e:
+                err_msg = str(e)
+                batch_id = getattr(e, 'batch_id', None)
+                if batch_id:
+                    if messagebox.askyesno("导入失败", err_msg + "\n\n是否立即导出错误清单？"):
+                        self._do_export_batch_errors(batch_id)
+                else:
+                    messagebox.showerror("导入失败", err_msg)
+            except Exception as e:
+                messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
+
+    def _on_draft_list(self):
+        dlg = DraftListDialog(self, self.service)
+        if not dlg.result:
+            return
+
+        action = dlg.result.get("action", "")
+        draft_id = dlg.result.get("draft_id")
+
+        if action == "new":
+            self._on_batch_import()
+        elif action == "edit":
+            self._open_draft_edit(draft_id)
+        elif action == "submit":
+            self._open_draft_edit(draft_id)
+        elif action == "delete":
+            pass
+        elif action == "export":
+            self._do_export_draft(draft_id)
+
+    def _open_draft_edit(self, draft_id):
+        dlg = DraftEditDialog(self, self.service, draft_id)
+        if dlg.result and dlg.result.get("action") == "submitted":
             self._refresh_table()
-            msg = (f"导入成功！批次号: {result['batch_no']}\n\n"
-                   f"共 {result['summary']['total']} 条:\n"
-                   f"  新增: {result['summary']['new']} 条\n"
-                   f"  更新: {result['summary']['update']} 条\n"
-                   f"  跳过: {result['summary']['skip']} 条\n"
-                   f"  错误: {result['summary']['error']} 条")
-            if result['summary']['error'] > 0:
-                if messagebox.askyesno("导入完成（有错误）", msg + "\n\n是否导出错误清单？"):
-                    self._do_export_batch_errors(result['batch_id'])
-            else:
-                messagebox.showinfo("导入成功", msg)
-        except ValueError as e:
-            err_msg = str(e)
-            batch_id = getattr(e, 'batch_id', None)
-            if batch_id:
-                if messagebox.askyesno("导入失败", err_msg + "\n\n是否立即导出错误清单？"):
-                    self._do_export_batch_errors(batch_id)
-            else:
-                messagebox.showerror("导入失败", err_msg)
-        except Exception as e:
-            messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
+            batch_no = dlg.result.get("batch_no", "")
+            summary = dlg.result.get("summary", {})
+            msg = (f"提交成功！批次号: {batch_no}\n\n"
+                   f"共 {summary.get('total', 0)} 条:\n"
+                   f"  新增: {summary.get('new', 0)} 条\n"
+                   f"  更新: {summary.get('update', 0)} 条\n"
+                   f"  跳过: {summary.get('skip', 0)} 条")
+            if messagebox.askyesno("提交成功", msg + "\n\n是否导出本次明细？"):
+                self._do_export_batch(dlg.result.get("batch_id"))
+
+    def _do_export_draft(self, draft_id):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择草稿明细导出目录")
+        if not directory:
+            return
+        draft = self.service.db.get_draft_batch(draft_id)
+        if not draft:
+            messagebox.showerror("错误", "草稿不存在")
+            return
+        filename = f"草稿明细_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_draft_items(draft_id, directory, filename, selected_only=False)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"草稿明细已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _do_export_batch(self, batch_id):
+        batch = self.service.db.get_import_batch(batch_id)
+        if not batch:
+            messagebox.showerror("错误", "批次不存在")
+            return
+        detail = self.service.get_import_batch_detail(batch_id)
+        if not detail:
+            messagebox.showerror("错误", "批次明细不存在")
+            return
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择批次明细导出目录")
+        if not directory:
+            return
+        filename = f"批次明细_{batch['batch_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            items = detail["items"]
+            filepath = Path(directory) / filename
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["行号", "灯具编号", "结果", "信息", "变更详情"])
+                for item in items:
+                    detail_parts = []
+                    if item.get("before_snapshot") and item.get("after_snapshot"):
+                        before = item.get("before_obj") or {}
+                        after = item.get("after_obj") or {}
+                        for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                            old_val = before.get(field, "")
+                            new_val = after.get(field, "")
+                            if field == "status" and not new_val:
+                                continue
+                            if new_val and new_val != old_val:
+                                detail_parts.append(f"{field}: {old_val} → {new_val}")
+                    detail_str = "; ".join(detail_parts)
+                    msg = item.get("error_message", "") or (item["result"] == RESULT_NEW and "新增成功") or (item["result"] == RESULT_UPDATE and "更新成功") or (item["result"] == RESULT_SKIP and "跳过（无变化）") or ""
+                    writer.writerow([item["row_index"], item["fixture_no"], item["result"], msg, detail_str])
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"批次明细已导出到:\n{filepath}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
 
     def _on_batch_history(self):
         dlg = BatchHistoryDialog(self, self.service)

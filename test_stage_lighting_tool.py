@@ -1726,6 +1726,475 @@ def test_failed_import_cross_restart_export():
     print("  PASS test_failed_import_cross_restart_export")
 
 
+def test_draft_create_from_precheck():
+    """草稿创建：从预检结果生成草稿，保存操作人、来源文件、备注等信息"""
+    svc, db = make_service()
+    svc.add_fixture("D001", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+    svc.add_fixture("D003", "SameModel", "", "A-01", "2027-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_create"
+    out_dir.mkdir()
+    rows = [
+        ["D001", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["D002", "BrandNew", "", "B-01", "2027-06-01", "NewGuy", "", ""],
+        ["D003", "SameModel", "", "A-01", "2027-01-01", "OldPerson", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    assert summary[RESULT_NEW] == 1
+    assert summary[RESULT_UPDATE] == 1
+    assert summary[RESULT_SKIP] == 1
+
+    result = svc.create_draft_from_precheck(
+        str(filepath), "草稿员1", precheck_results, summary,
+        filter_conditions={"location": "A-01"},
+        remark="测试草稿备注"
+    )
+    assert result["draft_id"] is not None
+    assert result["draft_no"].startswith("DFT")
+
+    drafts = svc.get_draft_batches()
+    assert len(drafts) == 1
+    assert drafts[0]["draft_no"] == result["draft_no"]
+    assert drafts[0]["operator"] == "草稿员1"
+    assert drafts[0]["source_file"] == "import_test.csv"
+    assert drafts[0]["remark"] == "测试草稿备注"
+    assert drafts[0]["status"] == "draft"
+    assert drafts[0]["record_count"] == 3
+    assert drafts[0]["new_count"] == 1
+    assert drafts[0]["update_count"] == 1
+    assert drafts[0]["skip_count"] == 1
+
+    detail = svc.get_draft_detail(result["draft_id"])
+    assert detail is not None
+    assert len(detail["items"]) == 3
+
+    new_items = [it for it in detail["items"] if it["result"] == RESULT_NEW]
+    update_items = [it for it in detail["items"] if it["result"] == RESULT_UPDATE]
+    skip_items = [it for it in detail["items"] if it["result"] == RESULT_SKIP]
+    assert len(new_items) == 1
+    assert len(update_items) == 1
+    assert len(skip_items) == 1
+
+    for it in new_items + update_items:
+        assert it["selected"] == 1
+    for it in skip_items:
+        assert it["selected"] == 0
+
+    for it in detail["items"]:
+        assert it["record_obj"] is not None
+        if it["result"] == RESULT_UPDATE:
+            assert it["before_obj"] is not None
+            assert it["after_obj"] is not None
+
+    initial_count = len(svc.get_fixtures())
+    assert initial_count == 2
+
+    db.close()
+    print("  PASS test_draft_create_from_precheck")
+
+
+def test_draft_persistence_across_restart():
+    """草稿跨重启持久化：关闭再打开能接着做"""
+    db_path = Path(TMP_DIR) / "draft_persist.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    out_dir = Path(TMP_DIR) / "draft_persist_dir"
+    out_dir.mkdir()
+    rows = [
+        ["DP001", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["DP002", "LED", "", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc1.parse_import_file(str(filepath))
+    precheck_results, summary = svc1.precheck_import(records)
+    create_result = svc1.create_draft_from_precheck(
+        str(filepath), "持久化测试员", precheck_results, summary,
+        filter_conditions={"status": STATUS_AVAILABLE},
+        remark="跨重启测试草稿"
+    )
+    draft_id = create_result["draft_id"]
+    draft_no = create_result["draft_no"]
+
+    svc1.update_draft_remark(draft_id, "更新后的备注")
+    items = db1.get_draft_items(draft_id)
+    if items:
+        svc1.set_draft_item_selected(items[0]["id"], False)
+
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    drafts = svc2.get_draft_batches()
+    assert len(drafts) == 1
+    assert drafts[0]["draft_no"] == draft_no
+    assert drafts[0]["operator"] == "持久化测试员"
+    assert drafts[0]["remark"] == "更新后的备注"
+    assert drafts[0]["status"] == "draft"
+
+    detail = svc2.get_draft_detail(draft_id)
+    assert detail is not None
+    assert len(detail["items"]) == 2
+
+    selected_count = sum(1 for it in detail["items"] if it["selected"])
+    assert selected_count == 1
+
+    fixture_count_before_submit = len(svc2.get_fixtures())
+    assert fixture_count_before_submit == 0
+
+    db2.close()
+    print("  PASS test_draft_persistence_across_restart")
+
+
+def test_draft_partial_submit():
+    """部分提交：只提交选中的记录，未选中的保留在草稿中"""
+    svc, db = make_service()
+    svc.add_fixture("PS001", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_partial"
+    out_dir.mkdir()
+    rows = [
+        ["PS001", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["PS002", "NewFixture1", "", "B-01", "2027-06-01", "NewGuy1", "", ""],
+        ["PS003", "NewFixture2", "", "B-02", "2027-06-01", "NewGuy2", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "部分提交员", precheck_results, summary,
+        remark="部分提交测试"
+    )
+    draft_id = create_result["draft_id"]
+
+    detail = svc.get_draft_detail(draft_id)
+    items = detail["items"]
+    assert len(items) == 3
+
+    for it in items:
+        if it["fixture_no"] == "PS002":
+            svc.set_draft_item_selected(it["id"], False)
+
+    submit_result = svc.submit_draft(draft_id, "提交操作员")
+    assert submit_result["summary"]["total"] == 2
+    assert submit_result["summary"]["new"] == 1
+    assert submit_result["summary"]["update"] == 1
+    assert submit_result["summary"]["skip"] == 0
+
+    fixtures = svc.get_fixtures()
+    assert len(fixtures) == 2
+
+    f1 = db.get_fixture_by_no("PS001")
+    assert f1 is not None
+    assert f1["model"] == "NewModel"
+
+    f2 = db.get_fixture_by_no("PS002")
+    assert f2 is None
+
+    f3 = db.get_fixture_by_no("PS003")
+    assert f3 is not None
+
+    draft_after = db.get_draft_batch(draft_id)
+    assert draft_after["status"] == "submitted"
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_no"] == submit_result["batch_no"]
+    assert batches[0]["status"] == "completed"
+    assert batches[0]["record_count"] == 2
+
+    batch_detail = svc.get_import_batch_detail(batches[0]["id"])
+    assert len(batch_detail["items"]) == 2
+    batch_nos = {it["fixture_no"] for it in batch_detail["items"]}
+    assert batch_nos == {"PS001", "PS003"}
+
+    db.close()
+    print("  PASS test_draft_partial_submit")
+
+
+def test_draft_export_matches_submit():
+    """导出明细与最终批次一致：草稿导出和提交后的批次导出应匹配"""
+    svc, db = make_service()
+    svc.add_fixture("EM001", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_export_match"
+    out_dir.mkdir()
+    rows = [
+        ["EM001", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["EM002", "NewFixture", "", "B-01", "2027-06-01", "NewGuy", "", ""],
+        ["EM003", "SkipModel", "", "C-01", "2027-01-01", "OldPerson", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "导出测试员", precheck_results, summary,
+        remark="导出一致性测试"
+    )
+    draft_id = create_result["draft_id"]
+
+    export_dir = Path(TMP_DIR) / "draft_exports"
+    export_dir.mkdir()
+    draft_export_path = svc.export_draft_items(draft_id, str(export_dir), "draft_items.csv", selected_only=True)
+
+    with open(draft_export_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        draft_exported = list(reader)
+    draft_selected_nos = {r["灯具编号"] for r in draft_exported if r["是否选中"] == "是"}
+
+    submit_result = svc.submit_draft(draft_id, "提交导出员")
+    batch_id = submit_result["batch_id"]
+
+    batch_detail = svc.get_import_batch_detail(batch_id)
+    batch_nos = {it["fixture_no"] for it in batch_detail["items"]}
+
+    assert draft_selected_nos == batch_nos
+    assert len(draft_selected_nos) == submit_result["summary"]["total"]
+
+    batch_export_path = Path(TMP_DIR) / "draft_exports" / "batch_items.csv"
+    with open(batch_export_path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "结果"])
+        for item in batch_detail["items"]:
+            writer.writerow([item["fixture_no"], item["result"]])
+
+    with open(batch_export_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        batch_exported = list(reader)
+    batch_export_nos = {r["灯具编号"] for r in batch_exported}
+
+    assert draft_selected_nos == batch_export_nos
+    assert len(batch_exported) == len(batch_detail["items"])
+
+    db.close()
+    print("  PASS test_draft_export_matches_submit")
+
+
+def test_draft_conflict_status_changed():
+    """冲突拦截：草稿期间同编号灯具状态变化，提交时要拦住"""
+    svc, db = make_service()
+    fid = svc.add_fixture("CS001", "Model", "", "A-01", "2027-01-01", "张三")
+
+    out_dir = Path(TMP_DIR) / "draft_conflict_status"
+    out_dir.mkdir()
+    rows = [
+        ["CS001", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "冲突测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    svc.borrow(fid, "借用人", "草稿期间借出")
+
+    try:
+        svc.submit_draft(draft_id, "提交员")
+        assert False, "Should have raised ValueError for status conflict"
+    except ValueError as e:
+        assert "冲突" in str(e) or "变化" in str(e)
+        assert hasattr(e, 'conflicts')
+        assert len(e.conflicts) >= 1
+        conflict_fixtures = [c["fixture_no"] for c in e.conflicts if c.get("fixture_no")]
+        assert "CS001" in conflict_fixtures
+
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_BORROWED
+    assert f["model"] == "Model"
+
+    batches = svc.get_import_batches()
+    completed_batches = [b for b in batches if b["status"] == "completed"]
+    assert len(completed_batches) == 0
+
+    draft = db.get_draft_batch(draft_id)
+    assert draft["status"] == "draft"
+
+    db.close()
+    print("  PASS test_draft_conflict_status_changed")
+
+
+def test_draft_conflict_other_batch_modified():
+    """冲突拦截：草稿期间同编号灯具被别的批次修改，提交时要拦住"""
+    svc, db = make_service()
+    svc.add_fixture("CO001", "OriginalModel", "old", "OldLoc", "2026-01-01", "OriginalPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_conflict_other"
+    out_dir.mkdir()
+    rows_draft = [
+        ["CO001", "DraftModel", "draft", "DraftLoc", "2027-06-01", "DraftPerson", "", ""],
+    ]
+    filepath_draft = _make_import_csv(out_dir, rows_draft)
+
+    records = svc.parse_import_file(str(filepath_draft))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath_draft), "草稿员A", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    other_rows = [
+        ["CO001", "OtherBatchModel", "other", "OtherLoc", "2027-12-01", "OtherPerson", "", ""],
+    ]
+    other_filepath = _make_import_csv(out_dir, other_rows, headers=None)
+    other_filepath = out_dir / "other_batch.csv"
+    with open(other_filepath, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "型号", "配件", "库位", "巡检到期日", "负责人", "状态", "最近备注"])
+        writer.writerow(["CO001", "OtherBatchModel", "other", "OtherLoc", "2027-12-01", "OtherPerson", "", ""])
+
+    svc.execute_import(str(other_filepath), "别的批次操作员", "other_batch.csv")
+
+    f = db.get_fixture_by_no("CO001")
+    assert f["model"] == "OtherBatchModel"
+
+    try:
+        svc.submit_draft(draft_id, "草稿提交员")
+        assert False, "Should have raised ValueError for other batch conflict"
+    except ValueError as e:
+        assert "冲突" in str(e) or "批次" in str(e)
+        assert hasattr(e, 'conflicts')
+        conflict_fixtures = [c["fixture_no"] for c in e.conflicts if c.get("fixture_no")]
+        assert "CO001" in conflict_fixtures
+
+    f_after = db.get_fixture_by_no("CO001")
+    assert f_after["model"] == "OtherBatchModel"
+
+    db.close()
+    print("  PASS test_draft_conflict_other_batch_modified")
+
+
+def test_draft_conflict_new_fixture_already_exists():
+    """冲突拦截：草稿中标记为新增的灯具，提交时已存在，要拦住"""
+    svc, db = make_service()
+
+    out_dir = Path(TMP_DIR) / "draft_conflict_new"
+    out_dir.mkdir()
+    rows = [
+        ["CN001", "NewModel", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    assert summary[RESULT_NEW] == 1
+
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "新增冲突测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    svc.add_fixture("CN001", "MeanwhileAdded", "", "B-01", "2027-06-01", "李四")
+
+    try:
+        svc.submit_draft(draft_id, "提交员")
+        assert False, "Should have raised ValueError for new conflict"
+    except ValueError as e:
+        assert hasattr(e, 'conflicts')
+        conflict_types = [c["type"] for c in e.conflicts]
+        assert "new_conflict" in conflict_types
+
+    f = db.get_fixture_by_no("CN001")
+    assert f["model"] == "MeanwhileAdded"
+
+    db.close()
+    print("  PASS test_draft_conflict_new_fixture_already_exists")
+
+
+def test_draft_select_by_result_and_all():
+    """草稿快捷选择：按结果类型批量选择/取消，全选/全不选"""
+    svc, db = make_service()
+    svc.add_fixture("SB001", "Old", "", "A-01", "2026-01-01", "OldPerson")
+    svc.add_fixture("SB004", "Skip", "", "C-01", "2026-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_select"
+    out_dir.mkdir()
+    rows = [
+        ["SB001", "NewModel", "", "A-01", "2027-01-01", "NewPerson", "", ""],
+        ["SB002", "New1", "", "B-01", "2027-01-01", "Person1", "", ""],
+        ["SB003", "New2", "", "B-02", "2027-01-01", "Person2", "", ""],
+        ["SB004", "Skip", "", "C-01", "2026-01-01", "OldPerson", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "选择测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    counts = db.count_draft_items_by_result(draft_id)
+    assert counts.get(RESULT_NEW, {}).get("selected", 0) == 2
+    assert counts.get(RESULT_UPDATE, {}).get("selected", 0) == 1
+    assert counts.get(RESULT_SKIP, {}).get("selected", 0) == 0
+
+    svc.set_draft_items_selected_by_result(draft_id, RESULT_NEW, False)
+    counts = db.count_draft_items_by_result(draft_id)
+    assert counts.get(RESULT_NEW, {}).get("selected", 0) == 0
+    assert counts.get(RESULT_UPDATE, {}).get("selected", 0) == 1
+
+    svc.set_all_draft_items_selected(draft_id, True)
+    counts = db.count_draft_items_by_result(draft_id)
+    total_selected = sum(c.get("selected", 0) for c in counts.values())
+    assert total_selected == 4
+
+    svc.set_all_draft_items_selected(draft_id, False)
+    counts = db.count_draft_items_by_result(draft_id)
+    total_selected = sum(c.get("selected", 0) for c in counts.values())
+    assert total_selected == 0
+
+    svc.set_draft_items_selected_by_result(draft_id, RESULT_SKIP, True)
+    counts = db.count_draft_items_by_result(draft_id)
+    assert counts.get(RESULT_SKIP, {}).get("selected", 0) == 1
+
+    db.close()
+    print("  PASS test_draft_select_by_result_and_all")
+
+
+def test_draft_no_side_effects_before_submit():
+    """草稿创建不影响数据库中的灯具数据"""
+    svc, db = make_service()
+    fid = svc.add_fixture("SE001", "Original", "acc", "Loc", "2027-01-01", "Person")
+
+    out_dir = Path(TMP_DIR) / "draft_side_effects"
+    out_dir.mkdir()
+    rows = [
+        ["SE001", "Modified", "new_acc", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["SE002", "NewFixture", "", "B-01", "2027-06-01", "NewGuy", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    svc.create_draft_from_precheck(
+        str(filepath), "测试员", precheck_results, summary, remark="无副作用测试"
+    )
+
+    f = db.get_fixture(fid)
+    assert f["model"] == "Original"
+    assert f["accessories"] == "acc"
+    assert f["location"] == "Loc"
+
+    f2 = db.get_fixture_by_no("SE002")
+    assert f2 is None
+
+    hist = db.get_history(fid)
+    assert len(hist) == 1
+
+    db.close()
+    print("  PASS test_draft_no_side_effects_before_submit")
+
+
 def main():
     setup()
     tests = [
@@ -1789,6 +2258,15 @@ def main():
         test_precheck_dialog_renders_without_crash,
         test_failed_import_to_export_full_chain,
         test_failed_import_cross_restart_export,
+        test_draft_create_from_precheck,
+        test_draft_persistence_across_restart,
+        test_draft_partial_submit,
+        test_draft_export_matches_submit,
+        test_draft_conflict_status_changed,
+        test_draft_conflict_other_batch_modified,
+        test_draft_conflict_new_fixture_already_exists,
+        test_draft_select_by_result_and_all,
+        test_draft_no_side_effects_before_submit,
     ]
     passed = 0
     failed = 0

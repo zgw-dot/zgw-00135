@@ -2195,6 +2195,225 @@ def test_draft_no_side_effects_before_submit():
     print("  PASS test_draft_no_side_effects_before_submit")
 
 
+def test_draft_reopen_submit_consistent():
+    """草稿重开提交一致性：直接传filepath提交 vs 从列表重开不传filepath提交，结果一致"""
+    out_dir = Path(TMP_DIR) / "draft_reopen_consist_dir"
+    out_dir.mkdir()
+    rows = [
+        ["RC001", "ModelA", "acc1", "Loc1", "2027-01-01", "张三", "", ""],
+        ["RC002", "ModelB", "acc2", "Loc2", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    db_path1 = Path(TMP_DIR) / "draft_reopen_consist_1.db"
+    db1 = DatabaseManager(db_path1)
+    svc1 = LightingService(db1)
+    records1 = svc1.parse_import_file(str(filepath))
+    pre1, sum1 = svc1.precheck_import(records1)
+    cr1 = svc1.create_draft_from_precheck(str(filepath), "员A", pre1, sum1, remark="方式A")
+    res1 = svc1.submit_draft(cr1["draft_id"], "员A", str(filepath))
+    detail1 = svc1.get_import_batch_detail(res1["batch_id"])
+    fixtures1 = svc1.get_fixtures()
+    db1.close()
+
+    db_path2 = Path(TMP_DIR) / "draft_reopen_consist_2.db"
+    db2 = DatabaseManager(db_path2)
+    svc2 = LightingService(db2)
+    records2 = svc2.parse_import_file(str(filepath))
+    pre2, sum2 = svc2.precheck_import(records2)
+    cr2 = svc2.create_draft_from_precheck(str(filepath), "员B", pre2, sum2, remark="方式B")
+    res2 = svc2.submit_draft(cr2["draft_id"], "员B")
+    detail2 = svc2.get_import_batch_detail(res2["batch_id"])
+    fixtures2 = svc2.get_fixtures()
+    db2.close()
+
+    assert res1["summary"]["total"] == res2["summary"]["total"]
+    assert res1["summary"]["new"] == res2["summary"]["new"]
+    assert len(detail1["items"]) == len(detail2["items"])
+    for i in range(len(detail1["items"])):
+        assert detail1["items"][i]["fixture_no"] == detail2["items"][i]["fixture_no"]
+        assert detail1["items"][i]["result"] == detail2["items"][i]["result"]
+    assert len(fixtures1) == len(fixtures2) == 2
+
+    print("  PASS test_draft_reopen_submit_consistent")
+
+
+def test_draft_reopen_file_changed_conflict():
+    """草稿重开源文件替换拦截：源文件内容变化后，重开不传filepath提交也会被拦住"""
+    svc, db = make_service()
+
+    out_dir = Path(TMP_DIR) / "draft_file_changed"
+    out_dir.mkdir()
+    rows = [
+        ["FC001", "OrigModel", "", "Loc1", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "测试员", precheck_results, summary, remark="文件变化测试"
+    )
+    draft_id = create_result["draft_id"]
+
+    new_rows = [
+        ["FC001", "ChangedModel", "", "Loc1", "2027-01-01", "张三", "", ""],
+        ["FC002", "ExtraModel", "", "Loc2", "2027-01-01", "李四", "", ""],
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "型号", "配件", "存放位置", "下次定检日期", "负责人", "状态", "备注"])
+        for r in new_rows:
+            writer.writerow(r)
+
+    try:
+        svc.submit_draft(draft_id, "测试员")
+        assert False, "应该抛出ValueError"
+    except ValueError as e:
+        assert "冲突" in str(e) or "变化" in str(e)
+
+    initial_count = len(svc.get_fixtures())
+    assert initial_count == 0
+
+    db.close()
+    print("  PASS test_draft_reopen_file_changed_conflict")
+
+
+def test_draft_reopen_file_missing_conflict():
+    """草稿重开源文件缺失拦截：源文件被删除后，重开提交会被拦住"""
+    svc, db = make_service()
+
+    out_dir = Path(TMP_DIR) / "draft_file_missing"
+    out_dir.mkdir()
+    rows = [
+        ["FM001", "ModelA", "", "Loc1", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "测试员", precheck_results, summary, remark="文件缺失测试"
+    )
+    draft_id = create_result["draft_id"]
+
+    os.remove(filepath)
+
+    try:
+        svc.submit_draft(draft_id, "测试员")
+        assert False, "应该抛出ValueError"
+    except ValueError as e:
+        assert "冲突" in str(e) or "不存在" in str(e)
+
+    initial_count = len(svc.get_fixtures())
+    assert initial_count == 0
+
+    db.close()
+    print("  PASS test_draft_reopen_file_missing_conflict")
+
+
+def test_draft_cross_restart_reopen_file_changed():
+    """跨重启重开源文件变化拦截：关闭再打开后，替换源文件，提交仍然会被拦住"""
+    db_path = Path(TMP_DIR) / "draft_cross_restart_file.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    out_dir = Path(TMP_DIR) / "draft_cross_restart_fdir"
+    out_dir.mkdir()
+    rows = [
+        ["CR001", "OrigModel", "", "Loc1", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc1.parse_import_file(str(filepath))
+    precheck_results, summary = svc1.precheck_import(records)
+    create_result = svc1.create_draft_from_precheck(
+        str(filepath), "创建员", precheck_results, summary, remark="跨重启文件测试"
+    )
+    draft_id = create_result["draft_id"]
+    draft_no = create_result["draft_no"]
+
+    db1.close()
+
+    new_rows = [
+        ["CR001", "TamperedModel", "", "LocX", "2099-01-01", "黑客", "", ""],
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "型号", "配件", "存放位置", "下次定检日期", "负责人", "状态", "备注"])
+        for r in new_rows:
+            writer.writerow(r)
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    drafts = svc2.get_draft_batches()
+    assert len(drafts) == 1
+    assert drafts[0]["draft_no"] == draft_no
+    assert drafts[0]["source_file_path"] == str(filepath)
+
+    try:
+        svc2.submit_draft(draft_id, "重开提交员")
+        assert False, "跨重启后源文件变化应该被拦截"
+    except ValueError as e:
+        assert "变化" in str(e) or "冲突" in str(e)
+
+    fixtures = svc2.get_fixtures()
+    assert len(fixtures) == 0
+
+    detail = svc2.get_draft_detail(draft_id)
+    assert detail is not None
+    assert len(detail["items"]) == 1
+
+    db2.close()
+    print("  PASS test_draft_cross_restart_reopen_file_changed")
+
+
+def test_draft_export_reopen_consistent():
+    """草稿导出与重开一致性：重开后导出明细与创建时导出一致"""
+    svc, db = make_service()
+    svc.add_fixture("EC001", "OldModel", "old_acc", "OldLoc", "2026-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_export_consist"
+    out_dir.mkdir()
+    rows = [
+        ["EC001", "NewModel", "new_acc", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["EC002", "BrandNew", "", "B-01", "2027-06-01", "NewGuy", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "导出测试员", precheck_results, summary, remark="导出一致性测试"
+    )
+    draft_id = create_result["draft_id"]
+
+    export_dir1 = out_dir / "export1"
+    export_dir1.mkdir()
+    path1 = svc.export_draft_items(draft_id, str(export_dir1), "draft_export1.csv", selected_only=False)
+    with open(path1, "r", encoding="utf-8-sig") as fh:
+        content1 = fh.read()
+
+    draft_data = db.get_draft_batch(draft_id)
+    assert draft_data["source_file_path"] == str(filepath)
+    assert draft_data["source_file"] == "import_test.csv"
+
+    items = db.get_draft_items(draft_id)
+    assert len(items) == 2
+
+    export_dir2 = out_dir / "export2"
+    export_dir2.mkdir()
+    path2 = svc.export_draft_items(draft_id, str(export_dir2), "draft_export2.csv", selected_only=False)
+    with open(path2, "r", encoding="utf-8-sig") as fh:
+        content2 = fh.read()
+
+    assert content1 == content2
+
+    db.close()
+    print("  PASS test_draft_export_reopen_consistent")
+
+
 def main():
     setup()
     tests = [
@@ -2267,6 +2486,11 @@ def main():
         test_draft_conflict_new_fixture_already_exists,
         test_draft_select_by_result_and_all,
         test_draft_no_side_effects_before_submit,
+        test_draft_reopen_submit_consistent,
+        test_draft_reopen_file_changed_conflict,
+        test_draft_reopen_file_missing_conflict,
+        test_draft_cross_restart_reopen_file_changed,
+        test_draft_export_reopen_consistent,
     ]
     passed = 0
     failed = 0

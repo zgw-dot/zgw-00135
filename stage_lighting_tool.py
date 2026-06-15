@@ -158,6 +158,7 @@ class DatabaseManager:
                 draft_no TEXT UNIQUE NOT NULL,
                 operator TEXT NOT NULL DEFAULT '',
                 source_file TEXT NOT NULL DEFAULT '',
+                source_file_path TEXT NOT NULL DEFAULT '',
                 source_file_hash TEXT NOT NULL DEFAULT '',
                 filter_conditions TEXT NOT NULL DEFAULT '',
                 remark TEXT NOT NULL DEFAULT '',
@@ -197,6 +198,10 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_import_draft_items_draft ON import_draft_items(draft_id);
             CREATE INDEX IF NOT EXISTS idx_import_draft_items_fno ON import_draft_items(fixture_no);
         """)
+        try:
+            self.conn.execute("ALTER TABLE import_draft_batches ADD COLUMN source_file_path TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         self.conn.commit()
 
     def execute(self, sql, params=()):
@@ -349,10 +354,10 @@ class DatabaseManager:
         self.execute("DELETE FROM import_batches WHERE id=?", (batch_id,))
         self.commit()
 
-    def create_draft_batch(self, draft_no, operator, source_file, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count):
+    def create_draft_batch(self, draft_no, operator, source_file, source_file_path, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count):
         cur = self.execute(
-            "INSERT INTO import_draft_batches (draft_no, operator, source_file, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count, status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')",
-            (draft_no, operator, source_file, source_file_hash, filter_conditions or "", remark or "", record_count, new_count, update_count, skip_count, error_count),
+            "INSERT INTO import_draft_batches (draft_no, operator, source_file, source_file_path, source_file_hash, filter_conditions, remark, record_count, new_count, update_count, skip_count, error_count, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'draft')",
+            (draft_no, operator, source_file, source_file_path or "", source_file_hash, filter_conditions or "", remark or "", record_count, new_count, update_count, skip_count, error_count),
         )
         return cur.lastrowid
 
@@ -1137,7 +1142,7 @@ class LightingService:
         self.db.begin_transaction()
         try:
             draft_id = self.db.create_draft_batch(
-                draft_no, operator, source_name, file_hash, filter_json, remark,
+                draft_no, operator, source_name, str(filepath), file_hash, filter_json, remark,
                 summary["total"],
                 summary.get(RESULT_NEW, 0),
                 summary.get(RESULT_UPDATE, 0),
@@ -1212,15 +1217,26 @@ class LightingService:
         items = self.db.get_selected_draft_items(draft_id)
         conflicts = []
 
-        if filepath and draft["source_file_hash"]:
-            current_hash = self._compute_file_hash(filepath)
-            if current_hash and current_hash != draft["source_file_hash"]:
+        if not filepath:
+            filepath = draft.get("source_file_path", "")
+
+        if draft.get("source_file_hash"):
+            if not filepath or not os.path.exists(filepath):
                 conflicts.append({
-                    "type": "file_changed",
+                    "type": "file_missing",
                     "fixture_no": "",
                     "item_id": None,
-                    "detail": f"源文件内容已变化（原哈希: {draft['source_file_hash'][:8]}..., 当前: {current_hash[:8]}...），草稿数据可能已过时",
+                    "detail": f"源文件不存在（原路径: {filepath or '未记录'}），无法校验文件是否被修改",
                 })
+            else:
+                current_hash = self._compute_file_hash(filepath)
+                if current_hash and current_hash != draft["source_file_hash"]:
+                    conflicts.append({
+                        "type": "file_changed",
+                        "fixture_no": "",
+                        "item_id": None,
+                        "detail": f"源文件内容已变化（原哈希: {draft['source_file_hash'][:8]}..., 当前: {current_hash[:8]}...），草稿数据可能已过时",
+                    })
 
         for item in items:
             if item["result"] not in (RESULT_NEW, RESULT_UPDATE):
@@ -1941,6 +1957,9 @@ class DraftEditDialog(tk.Toplevel):
             messagebox.showerror("错误", "草稿不存在")
             self.destroy()
             return
+
+        if not self.source_filepath:
+            self.source_filepath = self.detail["draft"].get("source_file_path", "") or None
 
         main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)

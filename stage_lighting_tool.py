@@ -623,17 +623,44 @@ class LightingService:
         if not records:
             raise ValueError("文件中没有可导入的记录")
 
+        source_name = source_name or Path(filepath).name
+        batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
         precheck_results, summary = self.precheck_import(records)
+
         if summary[RESULT_ERROR] > 0:
+            self.db.begin_transaction()
+            try:
+                batch_id = self.db.create_import_batch(batch_no, operator, source_name, len(records))
+                counts = {RESULT_NEW: 0, RESULT_UPDATE: 0, RESULT_SKIP: 0, RESULT_ERROR: 0}
+                for pr in precheck_results:
+                    row_idx = pr["row"]
+                    fixture_no = pr["fixture_no"]
+                    result = pr["result"]
+                    error_msg = "; ".join(pr["errors"]) if pr["errors"] else ""
+                    before_snap = json.dumps(pr["before"], ensure_ascii=False) if pr["before"] else ""
+                    after_snap = json.dumps(pr["after"], ensure_ascii=False) if pr["after"] else ""
+                    self.db.add_import_batch_item(
+                        batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
+                    )
+                    if result in counts:
+                        counts[result] += 1
+                self.db.update_import_batch_counts(
+                    batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
+                )
+                self.db.update_import_batch_status(batch_id, "failed")
+                self.db.commit()
+            except Exception:
+                self.db.rollback_transaction()
+                raise
             error_details = []
             for r in precheck_results:
                 if r["result"] == RESULT_ERROR:
                     for e in r["errors"]:
                         error_details.append(f"第{r['row']}行 ({r['fixture_no']}): {e}")
-            raise ValueError("预检发现错误，导入已取消:\n" + "\n".join(error_details))
-
-        source_name = source_name or Path(filepath).name
-        batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            err = ValueError("预检发现错误，导入已取消:\n" + "\n".join(error_details) + f"\n(批次 {batch_no} 已记录，可在导入批次历史中查看并导出错误清单)")
+            err.batch_id = batch_id
+            err.batch_no = batch_no
+            raise err
 
         self.db.begin_transaction()
         try:
@@ -1172,6 +1199,7 @@ class BatchHistoryDialog(tk.Toplevel):
         self.tree.tag_configure("completed", foreground="#2e7d32")
         self.tree.tag_configure("rolled_back", foreground="#757575")
         self.tree.tag_configure("error", foreground="#c62828")
+        self.tree.tag_configure("failed", foreground="#c62828")
 
         self._refresh_batches()
         self.tree.bind("<<TreeviewSelect>>", self._on_select_batch)
@@ -1228,11 +1256,12 @@ class BatchHistoryDialog(tk.Toplevel):
         self.tree.delete(*self.tree.get_children())
         batches = self.service.get_import_batches()
         for b in batches:
-            tag = b["status"] if b["status"] in ("completed", "rolled_back") else "error"
+            tag = b["status"] if b["status"] in ("completed", "rolled_back", "failed") else "error"
             status_display = {
                 "pending": "处理中",
                 "completed": "已完成",
                 "rolled_back": "已回滚",
+                "failed": "预检失败",
                 "error": "错误",
             }.get(b["status"], b["status"])
             self.tree.insert("", "end", iid=str(b["id"]), values=(
@@ -1920,7 +1949,13 @@ class Application(tk.Tk):
             else:
                 messagebox.showinfo("导入成功", msg)
         except ValueError as e:
-            messagebox.showerror("导入失败", str(e))
+            err_msg = str(e)
+            batch_id = getattr(e, 'batch_id', None)
+            if batch_id:
+                if messagebox.askyesno("导入失败", err_msg + "\n\n是否立即导出错误清单？"):
+                    self._do_export_batch_errors(batch_id)
+            else:
+                messagebox.showerror("导入失败", err_msg)
         except Exception as e:
             messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
 

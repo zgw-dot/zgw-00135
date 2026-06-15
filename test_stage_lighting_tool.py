@@ -813,13 +813,17 @@ def test_import_error_no_partial_import():
         assert False, "Should have raised ValueError for missing model"
     except ValueError as e:
         assert "预检发现错误" in str(e)
+        assert hasattr(e, 'batch_id')
 
     after_count = len(svc.get_fixtures())
     assert after_count == initial_count
     f = db.get_fixture_by_no("L900")
     assert f is None
+
     batches = svc.get_import_batches()
-    assert len(batches) == 0
+    assert len(batches) == 1
+    assert batches[0]["status"] == "failed"
+    assert batches[0]["error_count"] >= 1
     db.close()
     print("  PASS test_import_error_no_partial_import")
 
@@ -1082,17 +1086,12 @@ def test_export_batch_errors():
         ["LE003", "LED", "", "A-03", "bad-date", "王五", "", ""],
     ]
     filepath = _make_import_csv(out_dir, rows)
-    records = svc.parse_import_file(str(filepath))
-    results, summary = svc.precheck_import(records)
-    assert summary[RESULT_ERROR] == 2
-
-    batch_id = db.create_import_batch("IMP_TEST_ERR", "test", "test.csv", len(records))
-    for r in results:
-        err = "; ".join(r["errors"]) if r["errors"] else ""
-        db.add_import_batch_item(batch_id, r["fixture_no"], r["row"], r["result"], err)
-    db.update_import_batch_status(batch_id, "completed")
-    db.update_import_batch_counts(batch_id, summary[RESULT_NEW], summary[RESULT_UPDATE], summary[RESULT_SKIP], summary[RESULT_ERROR])
-    db.commit()
+    try:
+        svc.execute_import(str(filepath), "test", "test.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        assert batch_id is not None
 
     export_dir = Path(TMP_DIR) / "err_export"
     export_dir.mkdir()
@@ -1100,10 +1099,9 @@ def test_export_batch_errors():
     assert os.path.exists(path)
     with open(path, encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        rows = list(reader)
-    assert rows[0] == ["行号", "灯具编号", "结果", "错误信息"]
-    assert len(rows) == 3
-    error_nos = {r[1] for r in rows[1:]}
+        rows_out = list(reader)
+    assert rows_out[0] == ["行号", "灯具编号", "结果", "错误信息"]
+    error_nos = {r[1] for r in rows_out[1:]}
     assert "" in error_nos
     assert "LE003" in error_nos
     db.close()
@@ -1236,6 +1234,203 @@ def test_existing_lending_flow_not_broken():
     print("  PASS test_existing_lending_flow_not_broken")
 
 
+def test_failed_import_creates_batch_record():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "failed_batch"
+    out_dir.mkdir()
+
+    fid = svc.add_fixture("FS001", "OldModel", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废测试")
+    initial_count = len(svc.get_fixtures())
+
+    rows = [
+        ["", "PAR64", "", "A-01", "bad-date", "", "", ""],
+        ["FS001", "NewModel", "", "A-01", "2027-01-01", "李四", "", ""],
+        ["FS002", "LED", "", "A-02", "2027-01-01", "王五", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    try:
+        svc.execute_import(str(filepath), "失败测试员", "failed.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        batch_no = getattr(e, 'batch_no', None)
+        assert batch_id is not None
+        assert batch_no is not None
+        assert "预检发现错误" in str(e)
+        assert batch_no in str(e)
+
+    assert len(svc.get_fixtures()) == initial_count
+    assert db.get_fixture_by_no("FS002") is None
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["status"] == "failed"
+    assert batches[0]["operator"] == "失败测试员"
+    assert batches[0]["source_file"] == "failed.csv"
+    assert batches[0]["error_count"] >= 2
+
+    detail = svc.get_import_batch_detail(batches[0]["id"])
+    error_items = [it for it in detail["items"] if it["result"] == RESULT_ERROR]
+    assert len(error_items) >= 2
+    error_msgs = "; ".join(it["error_message"] for it in error_items)
+    assert "灯具编号不能为空" in error_msgs or "缺少必填字段" in error_msgs
+    assert "已报废" in error_msgs or "日期格式错误" in error_msgs
+
+    try:
+        svc.rollback_batch(batches[0]["id"], "回滚员")
+        assert False, "Should not allow rollback of failed batch"
+    except ValueError as e:
+        assert "无法回滚" in str(e)
+
+    db.close()
+    print("  PASS test_failed_import_creates_batch_record")
+
+
+def test_failed_import_persistence_across_restart():
+    db_path = Path(TMP_DIR) / "failed_persist.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    out_dir = Path(TMP_DIR) / "failed_persist_dir"
+    out_dir.mkdir()
+    rows = [
+        ["FP001", "", "", "A-01", "bad-date", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    batch_id = None
+    batch_no = None
+    try:
+        svc1.execute_import(str(filepath), "重启测试员", "restart.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        batch_no = getattr(e, 'batch_no', None)
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    batches = svc2.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_no"] == batch_no
+    assert batches[0]["status"] == "failed"
+    assert batches[0]["operator"] == "重启测试员"
+
+    detail = svc2.get_import_batch_detail(batches[0]["id"])
+    error_items = [it for it in detail["items"] if it["result"] == RESULT_ERROR]
+    assert len(error_items) >= 1
+
+    export_dir = Path(TMP_DIR) / "failed_persist_export"
+    export_dir.mkdir()
+    path = svc2.export_batch_errors(batches[0]["id"], str(export_dir), "errors_after_restart.csv")
+    assert os.path.exists(path)
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows_out = list(reader)
+    assert rows_out[0] == ["行号", "灯具编号", "结果", "错误信息"]
+    assert len(rows_out) > 1
+
+    db2.close()
+    print("  PASS test_failed_import_persistence_across_restart")
+
+
+def test_failed_import_error_export_matches_precheck():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "err_match"
+    out_dir.mkdir()
+
+    fid = svc.add_fixture("EM001", "Model", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废")
+
+    rows = [
+        ["", "PAR64", "", "A-01", "bad-date", "", "无效状态", ""],
+        ["EM001", "NewModel", "", "A-01", "2027-01-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, precheck_summary = svc.precheck_import(records)
+
+    batch_id = None
+    try:
+        svc.execute_import(str(filepath), "匹配测试员", "match.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+
+    export_dir = Path(TMP_DIR) / "err_match_export"
+    export_dir.mkdir()
+    path = svc.export_batch_errors(batch_id, str(export_dir), "match_errors.csv")
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        exported = list(reader)
+
+    error_rows_precheck = [r for r in precheck_results if r["result"] == RESULT_ERROR]
+    assert len(exported) - 1 == len(error_rows_precheck)
+
+    exported_info = {}
+    for row in exported[1:]:
+        exported_info[row[1]] = row[3]
+
+    for r in error_rows_precheck:
+        fno = r["fixture_no"]
+        assert fno in exported_info, f"Fixture {fno} missing from export"
+        for err in r["errors"]:
+            assert err in exported_info[fno] or any(
+                kw in exported_info[fno] for kw in err.split(":")
+            ), f"Precheck error '{err}' not in export '{exported_info[fno]}'"
+
+    db.close()
+    print("  PASS test_failed_import_error_export_matches_precheck")
+
+
+def test_successful_import_unaffected_by_failed_batch():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "success_after_fail"
+    out_dir.mkdir()
+
+    fail_dir = out_dir / "fail"
+    fail_dir.mkdir()
+    fail_rows = [
+        ["SF001", "", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    fail_filepath = _make_import_csv(fail_dir, fail_rows)
+    try:
+        svc.execute_import(str(fail_filepath), "失败操作员", "fail.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError:
+        pass
+
+    fail_batches = [b for b in svc.get_import_batches() if b["status"] == "failed"]
+    assert len(fail_batches) == 1
+
+    success_dir = out_dir / "success"
+    success_dir.mkdir()
+    success_rows = [
+        ["SF002", "PAR64", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["SF003", "LED", "", "A-03", "2027-06-01", "王五", "", ""],
+    ]
+    success_filepath = _make_import_csv(success_dir, success_rows)
+    result = svc.execute_import(str(success_filepath), "成功操作员", "success.csv")
+    assert result["summary"]["new"] == 2
+    assert result["summary"]["error"] == 0
+
+    all_batches = svc.get_import_batches()
+    assert len(all_batches) == 2
+    completed_batches = [b for b in all_batches if b["status"] == "completed"]
+    assert len(completed_batches) == 1
+    assert completed_batches[0]["operator"] == "成功操作员"
+
+    f2 = db.get_fixture_by_no("SF002")
+    f3 = db.get_fixture_by_no("SF003")
+    assert f2 is not None
+    assert f3 is not None
+    assert f2["model"] == "PAR64"
+    assert f3["model"] == "LED"
+    db.close()
+    print("  PASS test_successful_import_unaffected_by_failed_batch")
+
+
 def main():
     setup()
     tests = [
@@ -1290,6 +1485,10 @@ def main():
         test_import_then_export_consistency,
         test_import_mixed_new_update_skip_rollback_mixed,
         test_existing_lending_flow_not_broken,
+        test_failed_import_creates_batch_record,
+        test_failed_import_persistence_across_restart,
+        test_failed_import_error_export_matches_precheck,
+        test_successful_import_unaffected_by_failed_batch,
     ]
     passed = 0
     failed = 0

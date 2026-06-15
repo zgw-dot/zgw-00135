@@ -17,6 +17,7 @@ from stage_lighting_tool import (
     STATUS_AVAILABLE, STATUS_BORROWED, STATUS_RETURN_PENDING,
     STATUS_INSPECTION_FREEZE, STATUS_MAINTENANCE_FREEZE, STATUS_SCRAPPED,
     SETTING_FILTER_LOCATION, SETTING_FILTER_STATUS, SETTING_FILTER_DUE_START, SETTING_FILTER_DUE_END,
+    RESULT_NEW, RESULT_UPDATE, RESULT_SKIP, RESULT_ERROR, EXPORT_HEADERS,
 )
 
 TMP_DIR = None
@@ -560,6 +561,681 @@ def test_reset_clears_persisted_filters():
     print("  PASS test_reset_clears_persisted_filters")
 
 
+def _make_import_csv(dirpath, rows, headers=None):
+    import csv
+    if headers is None:
+        headers = ["灯具编号", "型号", "配件", "库位", "巡检到期日", "负责人", "状态", "最近备注"]
+    filepath = dirpath / "import_test.csv"
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
+    return filepath
+
+
+def _make_import_json(dirpath, items):
+    import json
+    filepath = dirpath / "import_test.json"
+    with open(filepath, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, ensure_ascii=False, indent=2)
+    return filepath
+
+
+def test_import_parse_csv():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "parse_csv"
+    out_dir.mkdir()
+    rows = [
+        ["L100", "PAR64", "灯钩x1", "A-01", "2027-01-01", "张三", "", ""],
+        ["L101", "LED200", "灯钩x1", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    assert len(records) == 2
+    assert records[0]["fixture_no"] == "L100"
+    assert records[0]["model"] == "PAR64"
+    assert records[0]["person_in_charge"] == "张三"
+    db.close()
+    print("  PASS test_import_parse_csv")
+
+
+def test_import_parse_json():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "parse_json"
+    out_dir.mkdir()
+    items = [
+        {"fixture_no": "L200", "model": "Beam", "person_in_charge": "王五", "location": "B-01"},
+        {"fixture_no": "L201", "model": "Spot", "person_in_charge": "赵六", "inspection_due_date": "2027-12-01"},
+    ]
+    filepath = _make_import_json(out_dir, items)
+    records = svc.parse_import_file(str(filepath))
+    assert len(records) == 2
+    assert records[0]["fixture_no"] == "L200"
+    assert records[1]["inspection_due_date"] == "2027-12-01"
+    db.close()
+    print("  PASS test_import_parse_json")
+
+
+def test_import_precheck_validation_errors():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "precheck_err"
+    out_dir.mkdir()
+    rows = [
+        ["", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["L301", "", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["L302", "LED", "", "A-03", "bad-date", "王五", "", ""],
+        ["L303", "Beam", "", "A-04", "2027-01-01", "", "", ""],
+        ["L304", "Spot", "", "A-05", "2027-01-01", "赵六", "无效状态", ""],
+        ["L305", "L305dup", "", "A-06", "2027-01-01", "钱七", "", ""],
+        ["L305", "L305dup", "", "A-07", "2027-01-01", "孙八", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    results, summary = svc.precheck_import(records)
+    assert summary[RESULT_ERROR] == 6
+    assert summary["total"] == 7
+    errors_by_row = {}
+    for r in results:
+        if r["result"] == RESULT_ERROR:
+            errors_by_row[str(r["row"])] = r["errors"]
+    assert any("灯具编号不能为空" in e for e in errors_by_row.get("2", []))
+    assert any("缺少必填字段: 型号" in e for e in errors_by_row.get("3", []))
+    assert any("日期格式错误" in e for e in errors_by_row.get("4", []))
+    assert any("缺少必填字段: 负责人" in e for e in errors_by_row.get("5", []))
+    assert any("状态值无效" in e for e in errors_by_row.get("6", []))
+    assert any("文件内编号重复" in e for e in errors_by_row.get("8", []))
+    db.close()
+    print("  PASS test_import_precheck_validation_errors")
+
+
+def test_import_precheck_new_update_skip():
+    svc, db = make_service()
+    svc.add_fixture("L400", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+    svc.add_fixture("L401", "SameModel", "same", "SameLoc", "2027-01-01", "SamePerson")
+
+    out_dir = Path(TMP_DIR) / "precheck_mix"
+    out_dir.mkdir()
+    rows = [
+        ["L400", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["L401", "SameModel", "same", "SameLoc", "2027-01-01", "SamePerson", "", ""],
+        ["L402", "NewFixture", "", "B-01", "2027-06-01", "NewOperator", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    results, summary = svc.precheck_import(records)
+    assert summary[RESULT_NEW] == 1
+    assert summary[RESULT_UPDATE] == 1
+    assert summary[RESULT_SKIP] == 1
+    assert summary[RESULT_ERROR] == 0
+    for r in results:
+        if r["fixture_no"] == "L400":
+            assert r["result"] == RESULT_UPDATE
+        elif r["fixture_no"] == "L401":
+            assert r["result"] == RESULT_SKIP
+        elif r["fixture_no"] == "L402":
+            assert r["result"] == RESULT_NEW
+    db.close()
+    print("  PASS test_import_precheck_new_update_skip")
+
+
+def test_import_precheck_scraped_protected():
+    svc, db = make_service()
+    fid = svc.add_fixture("L500", "ToScrap", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废测试")
+
+    out_dir = Path(TMP_DIR) / "precheck_scrap"
+    out_dir.mkdir()
+    rows = [
+        ["L500", "OverwriteModel", "", "A-01", "2027-01-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    results, summary = svc.precheck_import(records)
+    assert summary[RESULT_ERROR] == 1
+    assert "已报废" in results[0]["errors"][0]
+    db.close()
+    print("  PASS test_import_precheck_scraped_protected")
+
+
+def test_import_precheck_no_side_effects():
+    svc, db = make_service()
+    initial_count = len(svc.get_fixtures())
+
+    out_dir = Path(TMP_DIR) / "precheck_side"
+    out_dir.mkdir()
+    rows = [
+        ["L600", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["L601", "LED", "", "A-02", "2027-01-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    results, summary = svc.precheck_import(records)
+
+    assert summary[RESULT_NEW] == 2
+    assert len(svc.get_fixtures()) == initial_count
+    batches = svc.get_import_batches()
+    assert len(batches) == 0
+
+    after_count = db.execute("SELECT COUNT(*) as c FROM fixtures").fetchone()["c"]
+    assert after_count == initial_count
+    db.close()
+    print("  PASS test_import_precheck_no_side_effects")
+
+
+def test_import_execute_transaction_new():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "import_new"
+    out_dir.mkdir()
+    rows = [
+        ["L700", "PAR64", "灯钩x1", "A-01", "2027-01-01", "张三", "可用", "批量导入测试"],
+        ["L701", "LED200", "灯钩x1", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员1", "test.csv")
+    assert result["summary"]["new"] == 2
+    assert result["summary"]["total"] == 2
+
+    f1 = db.get_fixture_by_no("L700")
+    f2 = db.get_fixture_by_no("L701")
+    assert f1["model"] == "PAR64"
+    assert f1["person_in_charge"] == "张三"
+    assert f1["status"] == STATUS_AVAILABLE
+    assert f2["status"] == STATUS_AVAILABLE
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_no"] == result["batch_no"]
+    assert batches[0]["operator"] == "导入员1"
+    assert batches[0]["status"] == "completed"
+
+    detail = svc.get_import_batch_detail(result["batch_id"])
+    assert len(detail["items"]) == 2
+    for item in detail["items"]:
+        assert item["result"] == RESULT_NEW
+        assert item["before_snapshot"] == ""
+        assert item["after_snapshot"] != ""
+        assert item["after_obj"]["fixture_no"] in ("L700", "L701")
+
+    hist1 = db.get_history(f1["id"])
+    assert any(h["action"] == "批量导入" for h in hist1)
+    db.close()
+    print("  PASS test_import_execute_transaction_new")
+
+
+def test_import_execute_transaction_update():
+    svc, db = make_service()
+    fid = svc.add_fixture("L800", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+
+    out_dir = Path(TMP_DIR) / "import_update"
+    out_dir.mkdir()
+    rows = [
+        ["L800", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", "已更新"],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员2", "test.csv")
+    assert result["summary"]["update"] == 1
+    assert result["summary"]["new"] == 0
+
+    f = db.get_fixture(fid)
+    assert f["model"] == "NewModel"
+    assert f["location"] == "NewLoc"
+    assert f["inspection_due_date"] == "2027-12-01"
+    assert f["person_in_charge"] == "NewPerson"
+    assert f["status"] == STATUS_AVAILABLE
+
+    detail = svc.get_import_batch_detail(result["batch_id"])
+    item = detail["items"][0]
+    assert item["result"] == RESULT_UPDATE
+    before = item["before_obj"]
+    after = item["after_obj"]
+    assert before["model"] == "OldModel"
+    assert after["model"] == "NewModel"
+
+    hist = db.get_history(fid)
+    assert any(h["action"] == "批量更新" for h in hist)
+    db.close()
+    print("  PASS test_import_execute_transaction_update")
+
+
+def test_import_error_no_partial_import():
+    svc, db = make_service()
+    initial_count = len(svc.get_fixtures())
+    out_dir = Path(TMP_DIR) / "import_atomic"
+    out_dir.mkdir()
+    rows = [
+        ["L900", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["L901", "", "", "A-02", "2027-01-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    try:
+        svc.execute_import(str(filepath), "导入员3", "test.csv")
+        assert False, "Should have raised ValueError for missing model"
+    except ValueError as e:
+        assert "预检发现错误" in str(e)
+
+    after_count = len(svc.get_fixtures())
+    assert after_count == initial_count
+    f = db.get_fixture_by_no("L900")
+    assert f is None
+    batches = svc.get_import_batches()
+    assert len(batches) == 0
+    db.close()
+    print("  PASS test_import_error_no_partial_import")
+
+
+def test_import_persistence_across_restart():
+    db_path = Path(TMP_DIR) / "import_persist.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    out_dir = Path(TMP_DIR) / "import_persist"
+    out_dir.mkdir()
+    rows = [
+        ["LP001", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["LP002", "LED", "", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc1.execute_import(str(filepath), "导入员4", "persist.csv")
+    batch_no = result["batch_no"]
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    batches = svc2.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_no"] == batch_no
+    assert batches[0]["status"] == "completed"
+
+    detail = svc2.get_import_batch_detail(batches[0]["id"])
+    assert len(detail["items"]) == 2
+    assert detail["items"][0]["fixture_no"] == "LP001"
+
+    f1 = db2.get_fixture_by_no("LP001")
+    f2 = db2.get_fixture_by_no("LP002")
+    assert f1 is not None
+    assert f2 is not None
+    db2.close()
+    print("  PASS test_import_persistence_across_restart")
+
+
+def test_rollback_new_fixtures():
+    svc, db = make_service()
+    initial_count = len(svc.get_fixtures())
+
+    out_dir = Path(TMP_DIR) / "rollback_new"
+    out_dir.mkdir()
+    rows = [
+        ["LR001", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["LR002", "LED", "", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员5", "test.csv")
+    batch_id = result["batch_id"]
+
+    assert len(svc.get_fixtures()) == initial_count + 2
+
+    rb = svc.rollback_batch(batch_id, "回滚员1")
+    assert rb["rolled_back"] == 2
+    assert len(rb["conflicts"]) == 0
+
+    assert len(svc.get_fixtures()) == initial_count
+    assert db.get_fixture_by_no("LR001") is None
+    assert db.get_fixture_by_no("LR002") is None
+
+    batch = db.get_import_batch(batch_id)
+    assert batch["status"] == "rolled_back"
+
+    detail = svc.get_import_batch_detail(batch_id)
+    for item in detail["items"]:
+        assert item["result"] == RESULT_SKIP
+        assert "已回滚" in item["error_message"]
+    db.close()
+    print("  PASS test_rollback_new_fixtures")
+
+
+def test_rollback_update_fixtures():
+    svc, db = make_service()
+    fid = svc.add_fixture("LR100", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+    f_before = db.get_fixture(fid)
+
+    out_dir = Path(TMP_DIR) / "rollback_update"
+    out_dir.mkdir()
+    rows = [
+        ["LR100", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", "updated"],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员6", "test.csv")
+    batch_id = result["batch_id"]
+
+    f_after = db.get_fixture(fid)
+    assert f_after["model"] == "NewModel"
+
+    rb = svc.rollback_batch(batch_id, "回滚员2")
+    assert rb["rolled_back"] == 1
+
+    f_final = db.get_fixture(fid)
+    assert f_final["model"] == f_before["model"]
+    assert f_final["location"] == f_before["location"]
+    assert f_final["person_in_charge"] == f_before["person_in_charge"]
+    assert f_final["inspection_due_date"] == f_before["inspection_due_date"]
+
+    hist = db.get_history(fid)
+    assert any(h["action"] == "批次回滚" for h in hist)
+    db.close()
+    print("  PASS test_rollback_update_fixtures")
+
+
+def test_rollback_conflict_borrowed():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_conflict"
+    out_dir.mkdir()
+    rows = [
+        ["LC001", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["LC002", "LED", "", "A-02", "2027-06-01", "李四", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员7", "test.csv")
+    batch_id = result["batch_id"]
+
+    f1 = db.get_fixture_by_no("LC001")
+    svc.borrow(f1["id"], "借用人", "演出借用")
+
+    rb = svc.rollback_batch(batch_id, "回滚员3")
+    assert rb["rolled_back"] == 1
+    assert len(rb["conflicts"]) == 1
+    assert rb["conflicts"][0]["fixture_no"] == "LC001"
+    assert "借出" in rb["conflicts"][0]["reason"]
+
+    assert db.get_fixture_by_no("LC001") is not None
+    assert db.get_fixture_by_no("LC002") is None
+    db.close()
+    print("  PASS test_rollback_conflict_borrowed")
+
+
+def test_rollback_conflict_all_items():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_all_conflict"
+    out_dir.mkdir()
+    rows = [
+        ["LC100", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员8", "test.csv")
+    batch_id = result["batch_id"]
+
+    f = db.get_fixture_by_no("LC100")
+    svc.borrow(f["id"], "借用人", "全部冲突测试")
+
+    rb = svc.rollback_batch(batch_id, "回滚员4")
+    assert rb["rolled_back"] == 0
+    assert len(rb["conflicts"]) == 1
+    assert rb["conflicts"][0]["fixture_no"] == "LC100"
+    assert "借出" in rb["conflicts"][0]["reason"]
+
+    assert db.get_fixture_by_no("LC100") is not None
+    assert db.get_import_batch(batch_id)["status"] == "completed"
+    db.close()
+    print("  PASS test_rollback_conflict_all_items")
+
+
+def test_rollback_conflict_inspection_freeze():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_freeze"
+    out_dir.mkdir()
+    rows = [
+        ["LC200", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员9", "test.csv")
+    batch_id = result["batch_id"]
+
+    f = db.get_fixture_by_no("LC200")
+    svc.freeze_inspection(f["id"], "巡检员", "到期巡检")
+
+    rb = svc.rollback_batch(batch_id, "回滚员5")
+    assert rb["rolled_back"] == 0
+    assert len(rb["conflicts"]) == 1
+    assert "巡检冻结" in rb["conflicts"][0]["reason"]
+
+    f_after = db.get_fixture_by_no("LC200")
+    assert f_after["status"] == STATUS_INSPECTION_FREEZE
+    db.close()
+    print("  PASS test_rollback_conflict_inspection_freeze")
+
+
+def test_rollback_conflict_maintenance_freeze():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_maint"
+    out_dir.mkdir()
+    rows = [
+        ["LC300", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员10", "test.csv")
+    batch_id = result["batch_id"]
+
+    f = db.get_fixture_by_no("LC300")
+    svc.freeze_maintenance(f["id"], "维修员", "灯泡损坏")
+
+    rb = svc.rollback_batch(batch_id, "回滚员6")
+    assert rb["rolled_back"] == 0
+    assert len(rb["conflicts"]) == 1
+    assert "维修冻结" in rb["conflicts"][0]["reason"]
+    db.close()
+    print("  PASS test_rollback_conflict_maintenance_freeze")
+
+
+def test_rollback_conflict_scrapped():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_scrap"
+    out_dir.mkdir()
+    rows = [
+        ["LC400", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员11", "test.csv")
+    batch_id = result["batch_id"]
+
+    f = db.get_fixture_by_no("LC400")
+    svc.scrap(f["id"], "管理员", "报废")
+
+    rb = svc.rollback_batch(batch_id, "回滚员7")
+    assert rb["rolled_back"] == 0
+    assert len(rb["conflicts"]) == 1
+    assert "报废" in rb["conflicts"][0]["reason"]
+    db.close()
+    print("  PASS test_rollback_conflict_scrapped")
+
+
+def test_rollback_conflict_return_pending():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "rollback_return"
+    out_dir.mkdir()
+    rows = [
+        ["LC500", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员12", "test.csv")
+    batch_id = result["batch_id"]
+
+    f = db.get_fixture_by_no("LC500")
+    svc.borrow(f["id"], "借用人", "借用")
+    svc.return_fixture(f["id"], "借用人", "归还")
+
+    rb = svc.rollback_batch(batch_id, "回滚员8")
+    assert rb["rolled_back"] == 0
+    assert len(rb["conflicts"]) == 1
+    assert "借出" in rb["conflicts"][0]["reason"] or "归还" in rb["conflicts"][0]["reason"]
+    db.close()
+    print("  PASS test_rollback_conflict_return_pending")
+
+
+def test_export_batch_errors():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "export_errors"
+    out_dir.mkdir()
+    rows = [
+        ["LE001", "PAR64", "", "A-01", "2027-01-01", "张三", "", ""],
+        ["", "", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["LE003", "LED", "", "A-03", "bad-date", "王五", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    results, summary = svc.precheck_import(records)
+    assert summary[RESULT_ERROR] == 2
+
+    batch_id = db.create_import_batch("IMP_TEST_ERR", "test", "test.csv", len(records))
+    for r in results:
+        err = "; ".join(r["errors"]) if r["errors"] else ""
+        db.add_import_batch_item(batch_id, r["fixture_no"], r["row"], r["result"], err)
+    db.update_import_batch_status(batch_id, "completed")
+    db.update_import_batch_counts(batch_id, summary[RESULT_NEW], summary[RESULT_UPDATE], summary[RESULT_SKIP], summary[RESULT_ERROR])
+    db.commit()
+
+    export_dir = Path(TMP_DIR) / "err_export"
+    export_dir.mkdir()
+    path = svc.export_batch_errors(batch_id, str(export_dir), "errors.csv")
+    assert os.path.exists(path)
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    assert rows[0] == ["行号", "灯具编号", "结果", "错误信息"]
+    assert len(rows) == 3
+    error_nos = {r[1] for r in rows[1:]}
+    assert "" in error_nos
+    assert "LE003" in error_nos
+    db.close()
+    print("  PASS test_export_batch_errors")
+
+
+def test_export_import_template():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "template_export"
+    out_dir.mkdir()
+
+    csv_path = svc.export_import_template(str(out_dir), "template.csv", fmt="csv")
+    assert os.path.exists(csv_path)
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    assert rows[0] == EXPORT_HEADERS
+    assert len(rows) == 3
+
+    json_path = svc.export_import_template(str(out_dir), "template.json", fmt="json")
+    assert os.path.exists(json_path)
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data) == 2
+    assert data[0]["fixture_no"] == "L001"
+    db.close()
+    print("  PASS test_export_import_template")
+
+
+def test_import_then_export_consistency():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "import_export"
+    out_dir.mkdir()
+    rows = [
+        ["LX001", "PAR64", "灯钩x1", "A-01", "2027-01-01", "张三", "可用", "导入导出测试1"],
+        ["LX002", "LED200", "灯钩x1,电源线x1", "A-02", "2027-06-01", "李四", "可用", "导入导出测试2"],
+        ["LX003", "Beam 300", "灯钩x2", "A-03", "2027-12-01", "王五", "可用", "导入导出测试3"],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    svc.execute_import(str(filepath), "导入员13", "consistency.csv")
+
+    fixtures = svc.get_fixtures()
+    exported = out_dir / "exported.csv"
+    svc.export_csv(fixtures, str(out_dir), "exported.csv")
+
+    with open(exported, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        exported_rows = list(reader)
+
+    for i, orig in enumerate(rows):
+        exp = exported_rows[i]
+        assert exp["灯具编号"] == orig[0]
+        assert exp["型号"] == orig[1]
+        assert exp["配件"] == orig[2]
+        assert exp["库位"] == orig[3]
+        assert exp["巡检到期日"] == orig[4]
+        assert exp["负责人"] == orig[5]
+        assert exp["状态"] == orig[6]
+    db.close()
+    print("  PASS test_import_then_export_consistency")
+
+
+def test_import_mixed_new_update_skip_rollback_mixed():
+    svc, db = make_service()
+    svc.add_fixture("LM001", "OldModel", "old", "OldLoc", "2026-01-01", "OldPerson")
+    svc.add_fixture("LM002", "SameModel", "same", "SameLoc", "2027-01-01", "SamePerson")
+    initial_count = len(svc.get_fixtures())
+
+    out_dir = Path(TMP_DIR) / "mixed_rollback"
+    out_dir.mkdir()
+    rows = [
+        ["LM001", "NewModel", "new", "NewLoc", "2027-12-01", "NewPerson", "", ""],
+        ["LM002", "SameModel", "same", "SameLoc", "2027-01-01", "SamePerson", "", ""],
+        ["LM003", "BrandNew", "", "C-01", "2027-06-01", "NewGuy", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    result = svc.execute_import(str(filepath), "导入员14", "mixed.csv")
+    batch_id = result["batch_id"]
+
+    assert len(svc.get_fixtures()) == initial_count + 1
+    f1 = db.get_fixture_by_no("LM001")
+    assert f1["model"] == "NewModel"
+
+    rb = svc.rollback_batch(batch_id, "回滚员9")
+    assert rb["rolled_back"] == 2
+    assert len(rb["conflicts"]) == 0
+
+    assert len(svc.get_fixtures()) == initial_count
+    f1_final = db.get_fixture_by_no("LM001")
+    assert f1_final["model"] == "OldModel"
+    assert db.get_fixture_by_no("LM003") is None
+    db.close()
+    print("  PASS test_import_mixed_new_update_skip_rollback_mixed")
+
+
+def test_existing_lending_flow_not_broken():
+    svc, db = make_service()
+    fid = svc.add_fixture("FLOW001", "PAR64", "", "A-01", "2027-01-01", "张三")
+    assert db.get_fixture(fid)["status"] == STATUS_AVAILABLE
+
+    svc.borrow(fid, "王五", "演出借用")
+    assert db.get_fixture(fid)["status"] == STATUS_BORROWED
+
+    svc.return_fixture(fid, "王五", "归还完好")
+    assert db.get_fixture(fid)["status"] == STATUS_RETURN_PENDING
+
+    svc.review_return(fid, "李四", "复核通过")
+    assert db.get_fixture(fid)["status"] == STATUS_AVAILABLE
+
+    svc.freeze_inspection(fid, "巡检员", "到期")
+    assert db.get_fixture(fid)["status"] == STATUS_INSPECTION_FREEZE
+    svc.unfreeze_inspection(fid, "张三", "2027-12-31", "巡检完成")
+    assert db.get_fixture(fid)["status"] == STATUS_AVAILABLE
+
+    svc.freeze_maintenance(fid, "维修员", "损坏")
+    assert db.get_fixture(fid)["status"] == STATUS_MAINTENANCE_FREEZE
+    svc.unfreeze_maintenance(fid, "张三", "维修完成")
+    assert db.get_fixture(fid)["status"] == STATUS_AVAILABLE
+
+    hist = db.get_history(fid)
+    actions = [h["action"] for h in hist]
+    assert "借出" in actions
+    assert "归还登记" in actions
+    assert "复核入库" in actions
+    assert "巡检冻结" in actions
+    assert "巡检解冻" in actions
+    assert "维修冻结" in actions
+    assert "维修解冻" in actions
+    db.close()
+    print("  PASS test_existing_lending_flow_not_broken")
+
+
 def main():
     setup()
     tests = [
@@ -591,6 +1267,29 @@ def main():
         test_filter_due_range_effective_across_restart,
         test_export_uses_restored_filter_results,
         test_reset_clears_persisted_filters,
+        test_import_parse_csv,
+        test_import_parse_json,
+        test_import_precheck_validation_errors,
+        test_import_precheck_new_update_skip,
+        test_import_precheck_scraped_protected,
+        test_import_precheck_no_side_effects,
+        test_import_execute_transaction_new,
+        test_import_execute_transaction_update,
+        test_import_error_no_partial_import,
+        test_import_persistence_across_restart,
+        test_rollback_new_fixtures,
+        test_rollback_update_fixtures,
+        test_rollback_conflict_borrowed,
+        test_rollback_conflict_all_items,
+        test_rollback_conflict_inspection_freeze,
+        test_rollback_conflict_maintenance_freeze,
+        test_rollback_conflict_scrapped,
+        test_rollback_conflict_return_pending,
+        test_export_batch_errors,
+        test_export_import_template,
+        test_import_then_export_consistency,
+        test_import_mixed_new_update_skip_rollback_mixed,
+        test_existing_lending_flow_not_broken,
     ]
     passed = 0
     failed = 0

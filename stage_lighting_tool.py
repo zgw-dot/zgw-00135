@@ -67,6 +67,26 @@ SETTING_FILTER_STATUS = "filter_status"
 SETTING_FILTER_DUE_START = "filter_due_start"
 SETTING_FILTER_DUE_END = "filter_due_end"
 
+IMPORT_REQUIRED_FIELDS = ["fixture_no", "model", "person_in_charge"]
+IMPORT_FIELD_MAPPING_CSV = {
+    "灯具编号": "fixture_no",
+    "型号": "model",
+    "配件": "accessories",
+    "库位": "location",
+    "巡检到期日": "inspection_due_date",
+    "负责人": "person_in_charge",
+    "状态": "status",
+    "最近备注": "last_remark",
+}
+IMPORT_FIELD_MAPPING_JSON = {v: v for v in IMPORT_FIELD_MAPPING_CSV.values()}
+
+RESULT_NEW = "新增"
+RESULT_UPDATE = "更新"
+RESULT_SKIP = "跳过"
+RESULT_ERROR = "错误"
+
+ROLLBACK_SAFE_STATUSES = {STATUS_AVAILABLE}
+
 
 class DatabaseManager:
     def __init__(self, db_path):
@@ -107,10 +127,39 @@ class DatabaseManager:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT UNIQUE NOT NULL,
+                operator TEXT NOT NULL DEFAULT '',
+                source_file TEXT NOT NULL DEFAULT '',
+                record_count INTEGER NOT NULL DEFAULT 0,
+                new_count INTEGER NOT NULL DEFAULT 0,
+                update_count INTEGER NOT NULL DEFAULT 0,
+                skip_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS import_batch_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                fixture_no TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                result TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                before_snapshot TEXT NOT NULL DEFAULT '',
+                after_snapshot TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_fixtures_status ON fixtures(status);
             CREATE INDEX IF NOT EXISTS idx_fixtures_location ON fixtures(location);
             CREATE INDEX IF NOT EXISTS idx_fixtures_inspection ON fixtures(inspection_due_date);
             CREATE INDEX IF NOT EXISTS idx_history_fid ON history(fixture_id);
+            CREATE INDEX IF NOT EXISTS idx_import_batches_no ON import_batches(batch_no);
+            CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_batch_items(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_import_items_fno ON import_batch_items(fixture_no);
         """)
         self.conn.commit()
 
@@ -201,6 +250,74 @@ class DatabaseManager:
     def get_status_counts(self):
         rows = self.execute("SELECT status, COUNT(*) as cnt FROM fixtures GROUP BY status").fetchall()
         return {r["status"]: r["cnt"] for r in rows}
+
+    def create_import_batch(self, batch_no, operator, source_file, record_count):
+        cur = self.execute(
+            "INSERT INTO import_batches (batch_no, operator, source_file, record_count, status) VALUES (?,?,?,?,'pending')",
+            (batch_no, operator, source_file, record_count),
+        )
+        return cur.lastrowid
+
+    def update_import_batch_status(self, batch_id, status, error_message=""):
+        self.execute(
+            "UPDATE import_batches SET status=?, error_message=? WHERE id=?",
+            (status, error_message, batch_id),
+        )
+
+    def update_import_batch_counts(self, batch_id, new_count, update_count, skip_count, error_count):
+        self.execute(
+            "UPDATE import_batches SET new_count=?, update_count=?, skip_count=?, error_count=? WHERE id=?",
+            (new_count, update_count, skip_count, error_count, batch_id),
+        )
+
+    def add_import_batch_item(self, batch_id, fixture_no, row_index, result, error_message="", before_snapshot="", after_snapshot=""):
+        cur = self.execute(
+            "INSERT INTO import_batch_items (batch_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot) VALUES (?,?,?,?,?,?,?)",
+            (batch_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot),
+        )
+        return cur.lastrowid
+
+    def get_import_batches(self):
+        rows = self.execute("SELECT * FROM import_batches ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_import_batch(self, batch_id):
+        row = self.execute("SELECT * FROM import_batches WHERE id=?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_import_batch_by_no(self, batch_no):
+        row = self.execute("SELECT * FROM import_batches WHERE batch_no=?", (batch_no,)).fetchone()
+        return dict(row) if row else None
+
+    def get_import_batch_items(self, batch_id):
+        rows = self.execute("SELECT * FROM import_batch_items WHERE batch_id=? ORDER BY row_index", (batch_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_import_batch_errors(self, batch_id):
+        rows = self.execute("SELECT * FROM import_batch_items WHERE batch_id=? AND result=? ORDER BY row_index",
+                              (batch_id, RESULT_ERROR)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_batch_for_fixture(self, fixture_no):
+        row = self.execute(
+            "SELECT bi.*, b.batch_no, b.status as batch_status FROM import_batch_items bi "
+            "JOIN import_batches b ON bi.batch_id = b.id "
+            "WHERE bi.fixture_no=? AND bi.result IN (?,?) AND b.status='completed' "
+            "ORDER BY bi.created_at DESC LIMIT 1",
+            (fixture_no, RESULT_NEW, RESULT_UPDATE),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_import_batch(self, batch_id):
+        self.execute("DELETE FROM import_batch_items WHERE batch_id=?", (batch_id,))
+        self.execute("DELETE FROM import_batches WHERE id=?", (batch_id,))
+        self.commit()
+
+    def begin_transaction(self):
+        self.execute("BEGIN IMMEDIATE")
+
+    def rollback_transaction(self):
+        self.conn.rollback()
 
 
 class LightingService:
@@ -354,6 +471,514 @@ class LightingService:
     def get_status_counts(self):
         return self.db.get_status_counts()
 
+    def _parse_csv(self, filepath):
+        records = []
+        with open(filepath, "r", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            fieldnames = reader.fieldnames or []
+            for col in fieldnames:
+                if col not in IMPORT_FIELD_MAPPING_CSV:
+                    raise ValueError(f"未知列名: '{col}'。允许的列名: {list(IMPORT_FIELD_MAPPING_CSV.keys())}")
+            required_headers = [k for k, v in IMPORT_FIELD_MAPPING_CSV.items() if v in IMPORT_REQUIRED_FIELDS]
+            missing = [h for h in required_headers if h not in fieldnames]
+            if missing:
+                raise ValueError(f"缺少必填列: {missing}")
+            for i, row in enumerate(reader, start=2):
+                mapped = {}
+                for k, v in IMPORT_FIELD_MAPPING_CSV.items():
+                    mapped[v] = (row.get(k) or "").strip()
+                mapped["_row"] = i
+                records.append(mapped)
+        return records
+
+    def _parse_json(self, filepath):
+        records = []
+        with open(filepath, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            raise ValueError("JSON 根节点必须是数组")
+        required = ["fixture_no", "model", "person_in_charge"]
+        for i, item in enumerate(data, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {i} 条记录不是对象")
+            for k in required:
+                if k not in item:
+                    raise ValueError(f"第 {i} 条记录缺少必填字段: {k}")
+            mapped = {}
+            for k in IMPORT_FIELD_MAPPING_JSON:
+                mapped[k] = (str(item.get(k, "")) or "").strip()
+            mapped["_row"] = i
+            records.append(mapped)
+        return records
+
+    def parse_import_file(self, filepath):
+        ext = Path(filepath).suffix.lower()
+        if ext == ".csv":
+            return self._parse_csv(filepath)
+        elif ext == ".json":
+            return self._parse_json(filepath)
+        else:
+            raise ValueError(f"不支持的文件格式: {ext}。仅支持 .csv 和 .json")
+
+    def _validate_date(self, date_str):
+        if not date_str:
+            return True, ""
+        try:
+            date.fromisoformat(date_str)
+            return True, ""
+        except ValueError:
+            return False, f"日期格式错误，应为 YYYY-MM-DD"
+
+    def _validate_record(self, record, existing_by_no, seen_in_file):
+        errors = []
+        warnings = []
+        fixture_no = record.get("fixture_no", "")
+        row = record.get("_row", "?")
+
+        if not fixture_no:
+            errors.append("灯具编号不能为空")
+            return RESULT_ERROR, errors, warnings, None, None
+
+        for field in IMPORT_REQUIRED_FIELDS:
+            if not record.get(field, ""):
+                label = {v: k for k, v in IMPORT_FIELD_MAPPING_CSV.items()}.get(field, field)
+                errors.append(f"缺少必填字段: {label}")
+
+        status_val = record.get("status", "")
+        if status_val and status_val not in ALL_STATUSES:
+            errors.append(f"状态值无效: '{status_val}'，允许值: {ALL_STATUSES}")
+
+        date_ok, date_err = self._validate_date(record.get("inspection_due_date", ""))
+        if not date_ok:
+            errors.append(date_err)
+
+        if fixture_no in seen_in_file:
+            errors.append(f"文件内编号重复，第 {seen_in_file[fixture_no]} 行已出现")
+        seen_in_file[fixture_no] = row
+
+        existing = existing_by_no.get(fixture_no)
+        if existing:
+            if existing["status"] == STATUS_SCRAPPED:
+                errors.append(f"灯具已报废，不允许覆盖")
+
+        if errors:
+            return RESULT_ERROR, errors, warnings, None, None
+
+        if existing:
+            changed = False
+            for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                new_val = record.get(field, "")
+                old_val = existing.get(field, "")
+                if field == "status" and not new_val:
+                    continue
+                if new_val and new_val != old_val:
+                    changed = True
+                    break
+            if not changed:
+                return RESULT_SKIP, [], ["数据无变化"], existing, None
+            return RESULT_UPDATE, [], [], existing, record
+        else:
+            return RESULT_NEW, [], [], None, record
+
+    def precheck_import(self, records):
+        results = []
+        fixture_nos = [r["fixture_no"] for r in records if r.get("fixture_no")]
+        placeholders = ",".join("?" * len(fixture_nos))
+        existing_rows = []
+        if fixture_nos:
+            existing_rows = self.db.execute(
+                f"SELECT * FROM fixtures WHERE fixture_no IN ({placeholders})",
+                tuple(fixture_nos),
+            ).fetchall()
+        existing_by_no = {r["fixture_no"]: dict(r) for r in existing_rows}
+        seen_in_file = {}
+
+        for record in records:
+            result, errors, warnings, before, after = self._validate_record(record, existing_by_no, seen_in_file)
+            results.append({
+                "row": record.get("_row", "?"),
+                "fixture_no": record.get("fixture_no", ""),
+                "result": result,
+                "errors": errors,
+                "warnings": warnings,
+                "before": before,
+                "after": after,
+                "record": record,
+            })
+
+        summary = {
+            RESULT_NEW: sum(1 for r in results if r["result"] == RESULT_NEW),
+            RESULT_UPDATE: sum(1 for r in results if r["result"] == RESULT_UPDATE),
+            RESULT_SKIP: sum(1 for r in results if r["result"] == RESULT_SKIP),
+            RESULT_ERROR: sum(1 for r in results if r["result"] == RESULT_ERROR),
+            "total": len(results),
+        }
+        return results, summary
+
+    def execute_import(self, filepath, operator, source_name=None):
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        records = self.parse_import_file(filepath)
+        if not records:
+            raise ValueError("文件中没有可导入的记录")
+
+        precheck_results, summary = self.precheck_import(records)
+        if summary[RESULT_ERROR] > 0:
+            error_details = []
+            for r in precheck_results:
+                if r["result"] == RESULT_ERROR:
+                    for e in r["errors"]:
+                        error_details.append(f"第{r['row']}行 ({r['fixture_no']}): {e}")
+            raise ValueError("预检发现错误，导入已取消:\n" + "\n".join(error_details))
+
+        source_name = source_name or Path(filepath).name
+        batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        self.db.begin_transaction()
+        try:
+            batch_id = self.db.create_import_batch(batch_no, operator, source_name, len(records))
+
+            counts = {RESULT_NEW: 0, RESULT_UPDATE: 0, RESULT_SKIP: 0, RESULT_ERROR: 0}
+
+            for pr in precheck_results:
+                row_idx = pr["row"]
+                fixture_no = pr["fixture_no"]
+                result = pr["result"]
+                record = pr["record"]
+                before = pr["before"]
+                after = pr["after"]
+
+                before_snap = json.dumps(before, ensure_ascii=False) if before else ""
+                after_snap = ""
+                error_msg = ""
+
+                if result == RESULT_NEW:
+                    status_val = after.get("status") or STATUS_AVAILABLE
+                    fid = self.db.execute(
+                        "INSERT INTO fixtures (fixture_no,model,accessories,location,inspection_due_date,person_in_charge,status,last_remark) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            fixture_no,
+                            after.get("model", ""),
+                            after.get("accessories", ""),
+                            after.get("location", ""),
+                            after.get("inspection_due_date", ""),
+                            after.get("person_in_charge", ""),
+                            status_val,
+                            after.get("last_remark", f"批量导入，批次 {batch_no}"),
+                        ),
+                    ).lastrowid
+                    self.db.execute(
+                        "INSERT INTO history (fixture_id,action,from_status,to_status,operator,remark) VALUES (?,?,?,?,?,?)",
+                        (fid, "批量导入", "", status_val, operator, f"批次 {batch_no}"),
+                    )
+                    new_f = self.db.execute("SELECT * FROM fixtures WHERE id=?", (fid,)).fetchone()
+                    after_snap = json.dumps(dict(new_f), ensure_ascii=False)
+                    counts[RESULT_NEW] += 1
+
+                elif result == RESULT_UPDATE:
+                    fid = before["id"]
+                    old_status = before["status"]
+                    updates = {}
+                    for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status", "last_remark"]:
+                        new_val = after.get(field, "")
+                        old_val = before.get(field, "")
+                        if field == "status" and not new_val:
+                            continue
+                        if new_val and new_val != old_val:
+                            updates[field] = new_val
+
+                    if updates:
+                        sets = ", ".join(f"{k}=?" for k in updates)
+                        vals = list(updates.values()) + [fid]
+                        self.db.execute(f"UPDATE fixtures SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+                        new_status = updates.get("status", old_status)
+                        remark = f"批量更新，批次 {batch_no}"
+                        self.db.execute(
+                            "INSERT INTO history (fixture_id,action,from_status,to_status,operator,remark) VALUES (?,?,?,?,?,?)",
+                            (fid, "批量更新", old_status, new_status, operator, remark),
+                        )
+                    new_f = self.db.execute("SELECT * FROM fixtures WHERE id=?", (fid,)).fetchone()
+                    after_snap = json.dumps(dict(new_f), ensure_ascii=False)
+                    counts[RESULT_UPDATE] += 1
+
+                elif result == RESULT_SKIP:
+                    after_snap = before_snap
+                    counts[RESULT_SKIP] += 1
+
+                if pr["warnings"]:
+                    error_msg = "; ".join(pr["warnings"])
+
+                self.db.add_import_batch_item(
+                    batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
+                )
+
+            self.db.update_import_batch_counts(
+                batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
+            )
+            self.db.update_import_batch_status(batch_id, "completed")
+            self.db.commit()
+
+            return {
+                "batch_id": batch_id,
+                "batch_no": batch_no,
+                "summary": {
+                    "total": summary["total"],
+                    "new": counts[RESULT_NEW],
+                    "update": counts[RESULT_UPDATE],
+                    "skip": counts[RESULT_SKIP],
+                    "error": counts[RESULT_ERROR],
+                },
+            }
+
+        except Exception as e:
+            self.db.rollback_transaction()
+            raise
+
+    def _get_status_after_import(self, fixture_id, import_created_at):
+        row = self.db.execute(
+            "SELECT to_status FROM history WHERE fixture_id=? AND created_at>? ORDER BY created_at ASC LIMIT 1",
+            (fixture_id, import_created_at),
+        ).fetchone()
+        return row["to_status"] if row else None
+
+    def _has_conflicting_operations(self, fixture_id, import_created_at, import_batch_no):
+        rows = self.db.execute(
+            "SELECT * FROM history WHERE fixture_id=? AND created_at>=? AND action IN (?,?,?,?,?,?) AND remark NOT LIKE ?",
+            (fixture_id, import_created_at, "借出", "归还登记", "复核入库", "巡检冻结", "维修冻结", "报废", f"%批次 {import_batch_no}%"),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def rollback_batch(self, batch_id, operator):
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        batch = self.db.get_import_batch(batch_id)
+        if not batch:
+            raise ValueError("批次不存在")
+        if batch["status"] != "completed":
+            raise ValueError(f"批次状态为「{batch['status']}」，无法回滚")
+
+        items = self.db.get_import_batch_items(batch_id)
+        if not items:
+            raise ValueError("批次没有明细记录")
+
+        conflicts = []
+        safe_items = []
+
+        for item in items:
+            if item["result"] not in (RESULT_NEW, RESULT_UPDATE):
+                continue
+
+            fixture_no = item["fixture_no"]
+            current = self.db.get_fixture_by_no(fixture_no)
+
+            if item["result"] == RESULT_NEW:
+                if not current:
+                    safe_items.append(("delete", item, None))
+                    continue
+                fid = current["id"]
+                conflicting_ops = self._has_conflicting_operations(fid, batch["created_at"], batch["batch_no"])
+                if conflicting_ops:
+                    conflicts.append({
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "reason": f"新增后已发生操作: {[o['action'] for o in conflicting_ops]}",
+                        "current_status": current["status"],
+                    })
+                else:
+                    safe_items.append(("delete", item, current))
+
+            elif item["result"] == RESULT_UPDATE:
+                if not current:
+                    conflicts.append({
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "reason": "灯具已被删除，无法回滚更新",
+                        "current_status": "已删除",
+                    })
+                    continue
+
+                if current["status"] not in ROLLBACK_SAFE_STATUSES:
+                    conflicts.append({
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "reason": f"当前状态「{current['status']}」不允许回滚，仅「{STATUS_AVAILABLE}」可回滚",
+                        "current_status": current["status"],
+                    })
+                    continue
+
+                fid = current["id"]
+                conflicting_ops = self._has_conflicting_operations(fid, batch["created_at"], batch["batch_no"])
+                if conflicting_ops:
+                    conflicts.append({
+                        "fixture_no": fixture_no,
+                        "item_id": item["id"],
+                        "reason": f"更新后已发生操作: {[o['action'] for o in conflicting_ops]}",
+                        "current_status": current["status"],
+                    })
+                else:
+                    if not item["before_snapshot"]:
+                        conflicts.append({
+                            "fixture_no": fixture_no,
+                            "item_id": item["id"],
+                            "reason": "缺少变更前快照，无法安全回滚",
+                            "current_status": current["status"],
+                        })
+                    else:
+                        before = json.loads(item["before_snapshot"])
+                        safe_items.append(("restore", item, current, before))
+
+        if not safe_items:
+            return {
+                "rolled_back": 0,
+                "conflicts": conflicts,
+                "batch_no": batch["batch_no"],
+            }
+
+        self.db.begin_transaction()
+        try:
+            rollback_count = 0
+            for action in safe_items:
+                if action[0] == "delete":
+                    _, item, current = action
+                    if current:
+                        fid = current["id"]
+                        self.db.execute("DELETE FROM history WHERE fixture_id=?", (fid,))
+                        self.db.execute("DELETE FROM fixtures WHERE id=?", (fid,))
+                        self.db.execute(
+                            "UPDATE import_batch_items SET result=?, error_message=? WHERE id=?",
+                            (RESULT_SKIP, f"已回滚（删除新增），操作人: {operator}", item["id"]),
+                        )
+                    rollback_count += 1
+
+                elif action[0] == "restore":
+                    _, item, current, before = action
+                    fid = current["id"]
+                    old_status = current["status"]
+                    new_status = before.get("status", STATUS_AVAILABLE)
+                    self.db.execute(
+                        "UPDATE fixtures SET model=?, accessories=?, location=?, inspection_due_date=?, "
+                        "person_in_charge=?, status=?, last_remark=?, updated_at=datetime('now','localtime') WHERE id=?",
+                        (
+                            before.get("model", ""),
+                            before.get("accessories", ""),
+                            before.get("location", ""),
+                            before.get("inspection_due_date", ""),
+                            before.get("person_in_charge", ""),
+                            new_status,
+                            f"回滚到批次前状态，批次 {batch['batch_no']}",
+                            fid,
+                        ),
+                    )
+                    self.db.execute(
+                        "INSERT INTO history (fixture_id,action,from_status,to_status,operator,remark) VALUES (?,?,?,?,?,?)",
+                        (fid, "批次回滚", old_status, new_status, operator, f"回滚批次 {batch['batch_no']} 的更新"),
+                    )
+                    self.db.execute(
+                        "UPDATE import_batch_items SET result=?, error_message=? WHERE id=?",
+                        (RESULT_SKIP, f"已回滚（恢复原值），操作人: {operator}", item["id"]),
+                    )
+                    rollback_count += 1
+
+            self.db.update_import_batch_status(
+                batch_id,
+                "rolled_back",
+                f"已回滚 {rollback_count} 条，冲突 {len(conflicts)} 条: " +
+                "; ".join(f"{c['fixture_no']}: {c['reason']}" for c in conflicts),
+            )
+            self.db.commit()
+
+            return {
+                "rolled_back": rollback_count,
+                "conflicts": conflicts,
+                "batch_no": batch["batch_no"],
+            }
+
+        except Exception as e:
+            self.db.rollback_transaction()
+            raise
+
+    def get_import_batches(self):
+        return self.db.get_import_batches()
+
+    def get_import_batch_detail(self, batch_id):
+        batch = self.db.get_import_batch(batch_id)
+        if not batch:
+            return None
+        items = self.db.get_import_batch_items(batch_id)
+        for item in items:
+            if item["before_snapshot"]:
+                item["before_obj"] = json.loads(item["before_snapshot"])
+            else:
+                item["before_obj"] = None
+            if item["after_snapshot"]:
+                item["after_obj"] = json.loads(item["after_snapshot"])
+            else:
+                item["after_obj"] = None
+        return {"batch": batch, "items": items}
+
+    def export_batch_errors(self, batch_id, directory, filename):
+        batch = self.db.get_import_batch(batch_id)
+        if not batch:
+            raise ValueError("批次不存在")
+        errors = self.db.get_import_batch_errors(batch_id)
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["行号", "灯具编号", "结果", "错误信息"])
+            for e in errors:
+                writer.writerow([e["row_index"], e["fixture_no"], e["result"], e["error_message"]])
+        return str(filepath)
+
+    def export_import_template(self, directory, filename, fmt="csv"):
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+        filepath = dir_path / filename
+        if fmt == "csv":
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(EXPORT_HEADERS)
+                writer.writerow(["L001", "PAR64", "灯钩x1,电源线x1", "A-01", "2027-12-31", "张三", "可用", "示例记录-可删除"])
+                writer.writerow(["L002", "LED200", "灯钩x1", "A-02", "2027-06-30", "李四", "", ""])
+        elif fmt == "json":
+            data = [
+                {
+                    "fixture_no": "L001",
+                    "model": "PAR64",
+                    "accessories": "灯钩x1,电源线x1",
+                    "location": "A-01",
+                    "inspection_due_date": "2027-12-31",
+                    "person_in_charge": "张三",
+                    "status": "可用",
+                    "last_remark": "示例记录-可删除",
+                },
+                {
+                    "fixture_no": "L002",
+                    "model": "LED200",
+                    "accessories": "灯钩x1",
+                    "location": "A-02",
+                    "inspection_due_date": "2027-06-30",
+                    "person_in_charge": "李四",
+                    "status": "",
+                    "last_remark": "",
+                },
+            ]
+            with open(filepath, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        else:
+            raise ValueError(f"不支持的格式: {fmt}")
+        return str(filepath)
+
 
 class FormDialog(tk.Toplevel):
     def __init__(self, parent, title, fields, initial=None, width=360):
@@ -400,6 +1025,281 @@ class FormDialog(tk.Toplevel):
                 self.result[key] = widget.get("1.0", "end").strip()
             else:
                 self.result[key] = var.get().strip()
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class PrecheckDialog(tk.Toplevel):
+    def __init__(self, parent, filepath, precheck_results, summary):
+        super().__init__(parent)
+        self.title(f"导入预检 - {Path(filepath).name}")
+        self.result = None
+        self.precheck_results = precheck_results
+        self.summary = summary
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        summary_frame = ttk.LabelFrame(main, text="预检汇总", padding=8)
+        summary_frame.pack(fill="x", pady=(0, 8))
+
+        sum_text = (
+            f"共 {summary['total']} 条记录\n"
+            f"  新增: {summary[RESULT_NEW]} 条    "
+            f"更新: {summary[RESULT_UPDATE]} 条    "
+            f"跳过: {summary[RESULT_SKIP]} 条    "
+            f"错误: {summary[RESULT_ERROR]} 条"
+        )
+        ttk.Label(summary_frame, text=sum_text, font=("Arial", 10, "bold")).pack(anchor="w")
+
+        cols = ("row", "fixture_no", "result", "detail")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=15)
+        self.tree.heading("row", text="行号", anchor="center")
+        self.tree.heading("fixture_no", text="灯具编号", anchor="center")
+        self.tree.heading("result", text="结果", anchor="center")
+        self.tree.heading("detail", text="详情", anchor="w")
+        self.tree.column("row", width=60, anchor="center")
+        self.tree.column("fixture_no", width=100, anchor="center")
+        self.tree.column("result", width=80, anchor="center")
+        self.tree.column("detail", width=480, anchor="w")
+
+        result_tags = {
+            RESULT_NEW: ("new", "#1565c0"),
+            RESULT_UPDATE: ("update", "#2e7d32"),
+            RESULT_SKIP: ("skip", "#f57f17"),
+            RESULT_ERROR: ("error", "#c62828"),
+        }
+        for tag, _, color in result_tags.values():
+            self.tree.tag_configure(tag, foreground=color)
+
+        for r in precheck_results:
+            detail_parts = []
+            if r["errors"]:
+                detail_parts.append("错误: " + "; ".join(r["errors"]))
+            if r["warnings"]:
+                detail_parts.append("提示: " + "; ".join(r["warnings"]))
+            if not detail_parts:
+                if r["result"] == RESULT_NEW:
+                    detail_parts.append("将新增")
+                elif r["result"] == RESULT_UPDATE:
+                    changes = []
+                    for f in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                        old = r["before"].get(f, "") if r["before"] else ""
+                        new = r["after"].get(f, "") if r["after"] else ""
+                        if f == "status" and not new:
+                            continue
+                        if new and new != old:
+                            changes.append(f"{f}: {old} → {new}")
+                    detail_parts.append("更新: " + "; ".join(changes))
+                elif r["result"] == RESULT_SKIP:
+                    detail_parts.append("数据无变化")
+            detail = " | ".join(detail_parts)
+            tag_name, _ = result_tags.get(r["result"], ("", ""))
+            self.tree.insert("", "end", values=(r["row"], r["fixture_no"], r["result"], detail), tags=(tag_name,))
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        op_frame = ttk.Frame(main)
+        op_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(op_frame, text="操作人:").pack(side="left", padx=(0, 4))
+        self.operator_var = tk.StringVar()
+        ttk.Entry(op_frame, textvariable=self.operator_var, width=20).pack(side="left")
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        if summary[RESULT_ERROR] > 0:
+            ttk.Label(btn_frame, text=f"⚠️  存在 {summary[RESULT_ERROR]} 条错误，请修正后再导入", foreground="#c62828").pack(side="left")
+            ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
+        else:
+            ttk.Button(btn_frame, text="确认导入", command=self._ok, width=12).pack(side="right", padx=4)
+            ttk.Button(btn_frame, text="取消", command=self._cancel, width=12).pack(side="right")
+
+        self.geometry("800x600")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _ok(self):
+        self.result = {"operator": self.operator_var.get().strip()}
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class BatchHistoryDialog(tk.Toplevel):
+    def __init__(self, parent, service):
+        super().__init__(parent)
+        self.title("导入批次历史")
+        self.result = None
+        self.service = service
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        cols = ("batch_no", "created_at", "operator", "source_file", "total",
+                "new_count", "update_count", "skip_count", "error_count", "status")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=12)
+        headers = [
+            ("batch_no", "批次号", 140),
+            ("created_at", "导入时间", 150),
+            ("operator", "操作人", 80),
+            ("source_file", "来源文件", 180),
+            ("total", "总数", 50),
+            ("new_count", "新增", 50),
+            ("update_count", "更新", 50),
+            ("skip_count", "跳过", 50),
+            ("error_count", "错误", 50),
+            ("status", "状态", 80),
+        ]
+        for col_id, col_name, col_w in headers:
+            self.tree.heading(col_id, text=col_name, anchor="center")
+            self.tree.column(col_id, width=col_w, anchor="center")
+
+        self.tree.tag_configure("completed", foreground="#2e7d32")
+        self.tree.tag_configure("rolled_back", foreground="#757575")
+        self.tree.tag_configure("error", foreground="#c62828")
+
+        self._refresh_batches()
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_batch)
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        detail_frame = ttk.LabelFrame(main, text="批次明细", padding=8)
+        detail_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+        dcols = ("row", "fixture_no", "result", "error_message")
+        self.detail_tree = ttk.Treeview(detail_frame, columns=dcols, show="headings", height=8)
+        dheaders = [
+            ("row", "行号", 60),
+            ("fixture_no", "灯具编号", 100),
+            ("result", "结果", 80),
+            ("error_message", "信息", 420),
+        ]
+        for col_id, col_name, col_w in dheaders:
+            self.detail_tree.heading(col_id, text=col_name, anchor="center")
+            self.detail_tree.column(col_id, width=col_w, anchor="w")
+
+        self.detail_tree.tag_configure("new", foreground="#1565c0")
+        self.detail_tree.tag_configure("update", foreground="#2e7d32")
+        self.detail_tree.tag_configure("skip", foreground="#f57f17")
+        self.detail_tree.tag_configure("error", foreground="#c62828")
+
+        dvsb = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail_tree.yview)
+        self.detail_tree.configure(yscrollcommand=dvsb.set)
+        self.detail_tree.pack(side="left", fill="both", expand=True)
+        dvsb.pack(side="right", fill="y")
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        self.btn_rollback = ttk.Button(btn_frame, text="撤销此批次", command=self._on_rollback, width=14, state="disabled")
+        self.btn_rollback.pack(side="left", padx=4)
+
+        self.btn_export_errors = ttk.Button(btn_frame, text="导出错误清单", command=self._on_export_errors, width=14, state="disabled")
+        self.btn_export_errors.pack(side="left", padx=4)
+
+        self.detail_label = ttk.Label(btn_frame, text="")
+        self.detail_label.pack(side="left", padx=10)
+
+        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=12).pack(side="right")
+
+        self.geometry("900x700")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _refresh_batches(self):
+        self.tree.delete(*self.tree.get_children())
+        batches = self.service.get_import_batches()
+        for b in batches:
+            tag = b["status"] if b["status"] in ("completed", "rolled_back") else "error"
+            status_display = {
+                "pending": "处理中",
+                "completed": "已完成",
+                "rolled_back": "已回滚",
+                "error": "错误",
+            }.get(b["status"], b["status"])
+            self.tree.insert("", "end", iid=str(b["id"]), values=(
+                b["batch_no"], b["created_at"], b["operator"], b["source_file"],
+                b["record_count"], b["new_count"], b["update_count"],
+                b["skip_count"], b["error_count"], status_display
+            ), tags=(tag,))
+
+    def _on_select_batch(self, event=None):
+        sel = self.tree.selection()
+        self.detail_tree.delete(*self.detail_tree.get_children())
+        if not sel:
+            self.btn_rollback.config(state="disabled")
+            self.btn_export_errors.config(state="disabled")
+            self.detail_label.config(text="")
+            return
+
+        batch_id = int(sel[0])
+        detail = self.service.get_import_batch_detail(batch_id)
+        if not detail:
+            return
+
+        batch = detail["batch"]
+        can_rollback = batch["status"] == "completed"
+        has_errors = batch["error_count"] > 0
+        self.btn_rollback.config(state="normal" if can_rollback else "disabled")
+        self.btn_export_errors.config(state="normal" if has_errors else "disabled")
+
+        self.detail_label.config(
+            text=f"批次 {batch['batch_no']} | 总数 {batch['record_count']} | "
+                 f"新增 {batch['new_count']} 更新 {batch['update_count']} "
+                 f"跳过 {batch['skip_count']} 错误 {batch['error_count']}"
+        )
+
+        for item in detail["items"]:
+            tag = item["result"]
+            msg = item["error_message"]
+            if not msg and item["result"] == RESULT_NEW:
+                msg = "新增成功"
+            elif not msg and item["result"] == RESULT_UPDATE:
+                msg = "更新成功"
+            elif not msg and item["result"] == RESULT_SKIP:
+                msg = "跳过（无变化）"
+            self.detail_tree.insert("", "end", values=(
+                item["row_index"], item["fixture_no"], item["result"], msg
+            ), tags=(tag,))
+
+    def _on_rollback(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        batch_id = int(sel[0])
+        detail = self.service.get_import_batch_detail(batch_id)
+        if not detail or detail["batch"]["status"] != "completed":
+            messagebox.showerror("错误", "此批次无法回滚")
+            return
+        if not messagebox.askyesno("确认回滚", f"确定要撤销批次 {detail['batch']['batch_no']} 吗？\n这将回滚该批次的新增和更新记录。"):
+            return
+        self.result = {"action": "rollback", "batch_id": batch_id}
+        self.destroy()
+
+    def _on_export_errors(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        batch_id = int(sel[0])
+        self.result = {"action": "export_errors", "batch_id": batch_id}
         self.destroy()
 
     def _cancel(self):
@@ -467,6 +1367,9 @@ class Application(tk.Tk):
         file_menu.add_command(label="导出 CSV (当前筛选)...", command=self._on_export_csv)
         file_menu.add_command(label="导出 JSON (当前筛选)...", command=self._on_export_json)
         file_menu.add_separator()
+        file_menu.add_command(label="导出导入模板 (CSV)...", command=self._on_export_template_csv)
+        file_menu.add_command(label="导出导入模板 (JSON)...", command=self._on_export_template_json)
+        file_menu.add_separator()
         file_menu.add_command(label="设置常用导出目录...", command=self._on_set_export_dir)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.destroy)
@@ -476,6 +1379,9 @@ class Application(tk.Tk):
         action_menu.add_command(label="添加灯具", command=self._on_add_fixture)
         action_menu.add_command(label="编辑灯具信息", command=self._on_edit_fixture)
         action_menu.add_command(label="删除灯具", command=self._on_delete_fixture)
+        action_menu.add_separator()
+        action_menu.add_command(label="批量导入灯具台账...", command=self._on_batch_import)
+        action_menu.add_command(label="导入批次历史...", command=self._on_batch_history)
         menubar.add_cascade(label="操作", menu=action_menu)
 
         self.config(menu=menubar)
@@ -925,6 +1831,150 @@ class Application(tk.Tk):
             messagebox.showinfo("成功", f"灯具 {f['fixture_no']} 已报废")
         except ValueError as e:
             messagebox.showerror("报废失败", str(e))
+
+    # ---- Batch Import / Rollback GUI ----
+
+    def _on_export_template_csv(self):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择模板导出目录")
+        if not directory:
+            return
+        filename = "灯具导入模板.csv"
+        try:
+            path = self.service.export_import_template(directory, filename, fmt="csv")
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("成功", f"CSV 模板已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_export_template_json(self):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择模板导出目录")
+        if not directory:
+            return
+        filename = "灯具导入模板.json"
+        try:
+            path = self.service.export_import_template(directory, filename, fmt="json")
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("成功", f"JSON 模板已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_batch_import(self):
+        filepath = filedialog.askopenfilename(
+            title="选择灯具台账文件",
+            filetypes=[("CSV 文件", "*.csv"), ("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            records = self.service.parse_import_file(filepath)
+        except ValueError as e:
+            messagebox.showerror("解析失败", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("解析失败", f"读取文件时出错:\n{e}")
+            return
+
+        try:
+            precheck_results, summary = self.service.precheck_import(records)
+        except Exception as e:
+            messagebox.showerror("预检失败", f"预检时出错:\n{e}")
+            return
+
+        dlg = PrecheckDialog(self, filepath, precheck_results, summary)
+        if not dlg.result:
+            return
+
+        operator = dlg.result.get("operator", "").strip()
+        if not operator:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+
+        if not messagebox.askyesno(
+            "确认导入",
+            f"即将导入 {Path(filepath).name}\n\n"
+            f"共 {summary['total']} 条记录:\n"
+            f"  新增: {summary[RESULT_NEW]} 条\n"
+            f"  更新: {summary[RESULT_UPDATE]} 条\n"
+            f"  跳过: {summary[RESULT_SKIP]} 条\n"
+            f"  错误: {summary[RESULT_ERROR]} 条\n\n"
+            f"操作人: {operator}\n\n"
+            f"确认执行导入？",
+        ):
+            return
+
+        try:
+            result = self.service.execute_import(filepath, operator, Path(filepath).name)
+            self._refresh_table()
+            msg = (f"导入成功！批次号: {result['batch_no']}\n\n"
+                   f"共 {result['summary']['total']} 条:\n"
+                   f"  新增: {result['summary']['new']} 条\n"
+                   f"  更新: {result['summary']['update']} 条\n"
+                   f"  跳过: {result['summary']['skip']} 条\n"
+                   f"  错误: {result['summary']['error']} 条")
+            if result['summary']['error'] > 0:
+                if messagebox.askyesno("导入完成（有错误）", msg + "\n\n是否导出错误清单？"):
+                    self._do_export_batch_errors(result['batch_id'])
+            else:
+                messagebox.showinfo("导入成功", msg)
+        except ValueError as e:
+            messagebox.showerror("导入失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
+
+    def _on_batch_history(self):
+        dlg = BatchHistoryDialog(self, self.service)
+        if dlg.result and dlg.result.get("action") == "rollback":
+            batch_id = dlg.result["batch_id"]
+            self._do_rollback(batch_id)
+        elif dlg.result and dlg.result.get("action") == "export_errors":
+            batch_id = dlg.result["batch_id"]
+            self._do_export_batch_errors(batch_id)
+
+    def _do_rollback(self, batch_id):
+        fields = [("operator", "操作人", "")]
+        dlg = FormDialog(self, "批次回滚", fields)
+        if dlg.result is None:
+            return
+        operator = dlg.result.get("operator", "").strip()
+        if not operator:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+
+        try:
+            result = self.service.rollback_batch(batch_id, operator)
+            self._refresh_table()
+            msg = (f"回滚完成！批次号: {result['batch_no']}\n\n"
+                   f"成功回滚: {result['rolled_back']} 条")
+            if result['conflicts']:
+                conflict_details = "\n".join(
+                    f"  {c['fixture_no']}: {c['reason']}" for c in result['conflicts']
+                )
+                msg += f"\n\n存在冲突，跳过 {len(result['conflicts'])} 条:\n{conflict_details}"
+            messagebox.showinfo("回滚完成", msg)
+        except ValueError as e:
+            messagebox.showerror("回滚失败", str(e))
+        except Exception as e:
+            messagebox.showerror("回滚失败", f"回滚时发生错误:\n{e}")
+
+    def _do_export_batch_errors(self, batch_id):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择错误清单导出目录")
+        if not directory:
+            return
+        batch = self.service.db.get_import_batch(batch_id)
+        if not batch:
+            messagebox.showerror("错误", "批次不存在")
+            return
+        filename = f"批次错误_{batch['batch_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_batch_errors(batch_id, directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"错误清单已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
 
     # ---- Export ----
 

@@ -1102,7 +1102,7 @@ class PrecheckDialog(tk.Toplevel):
             RESULT_SKIP: ("skip", "#f57f17"),
             RESULT_ERROR: ("error", "#c62828"),
         }
-        for tag, _, color in result_tags.values():
+        for tag, color in result_tags.values():
             self.tree.tag_configure(tag, foreground=color)
 
         for r in precheck_results:

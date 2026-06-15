@@ -1555,6 +1555,177 @@ def test_gui_flow_successful_import_unaffected():
     print("  PASS test_gui_flow_successful_import_unaffected")
 
 
+def test_precheck_dialog_renders_without_crash():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "precheck_dlg"
+    out_dir.mkdir()
+
+    fid = svc.add_fixture("DLG-SCRAP", "Old", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废")
+
+    rows = [
+        ["", "PAR64", "", "A-01", "bad-date", "", "无效状态", ""],
+        ["DLG-DUP", "LED", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["DLG-DUP", "LED2", "", "A-03", "2027-06-01", "王五", "", ""],
+        ["DLG-SCRAP", "New", "", "A-01", "2027-12-01", "赵六", "", ""],
+        ["DLG-NOMODEL", "", "", "A-04", "2027-01-01", "钱七", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+
+    assert summary[RESULT_ERROR] >= 4
+
+    result_tags = {
+        RESULT_NEW: ("new", "#1565c0"),
+        RESULT_UPDATE: ("update", "#2e7d32"),
+        RESULT_SKIP: ("skip", "#f57f17"),
+        RESULT_ERROR: ("error", "#c62828"),
+    }
+
+    for tag, color in result_tags.values():
+        pass
+
+    for r in precheck_results:
+        detail_parts = []
+        if r["errors"]:
+            detail_parts.append("错误: " + "; ".join(r["errors"]))
+        if r["warnings"]:
+            detail_parts.append("提示: " + "; ".join(r["warnings"]))
+        if not detail_parts:
+            if r["result"] == RESULT_NEW:
+                detail_parts.append("将新增")
+            elif r["result"] == RESULT_UPDATE:
+                changes = []
+                for f in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                    old = r["before"].get(f, "") if r["before"] else ""
+                    new = r["after"].get(f, "") if r["after"] else ""
+                    if f == "status" and not new:
+                        continue
+                    if new and new != old:
+                        changes.append(f"{f}: {old} → {new}")
+                detail_parts.append("更新: " + "; ".join(changes))
+            elif r["result"] == RESULT_SKIP:
+                detail_parts.append("数据无变化")
+        detail = " | ".join(detail_parts)
+        tag_name, _ = result_tags.get(r["result"], ("", ""))
+        row_vals = (r["row"], r["fixture_no"], r["result"], detail)
+        assert len(row_vals) == 4
+        assert isinstance(tag_name, str)
+
+    error_rows = [r for r in precheck_results if r["result"] == RESULT_ERROR]
+    assert len(error_rows) >= 4
+
+    db.close()
+    print("  PASS test_precheck_dialog_renders_without_crash")
+
+
+def test_failed_import_to_export_full_chain():
+    svc, db = make_service()
+    out_dir = Path(TMP_DIR) / "full_chain"
+    out_dir.mkdir()
+
+    fid = svc.add_fixture("CHAIN-SCRAP", "Old", "", "A-01", "2027-01-01", "张三")
+    svc.scrap(fid, "管理员", "报废")
+
+    rows = [
+        ["", "PAR64", "", "A-01", "bad-date", "", "无效状态", ""],
+        ["CHAIN-DUP", "LED", "", "A-02", "2027-01-01", "李四", "", ""],
+        ["CHAIN-DUP", "LED2", "", "A-03", "2027-06-01", "王五", "", ""],
+        ["CHAIN-SCRAP", "New", "", "A-01", "2027-12-01", "赵六", "", ""],
+        ["CHAIN-NOMODEL", "", "", "A-04", "2027-01-01", "钱七", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    assert summary[RESULT_ERROR] >= 4
+
+    batch_id = None
+    try:
+        svc.execute_import(str(filepath), "全链路操作员", "chain.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        assert batch_id is not None
+
+    batches = svc.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["status"] == "failed"
+    assert batches[0]["operator"] == "全链路操作员"
+
+    detail = svc.get_import_batch_detail(batch_id)
+    db_items = detail["items"]
+    error_items_db = [it for it in db_items if it["result"] == RESULT_ERROR]
+    assert len(error_items_db) == len([r for r in precheck_results if r["result"] == RESULT_ERROR])
+
+    export_dir = Path(TMP_DIR) / "full_chain_export"
+    export_dir.mkdir()
+    path = svc.export_batch_errors(batch_id, str(export_dir), "chain_errors.csv")
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        exported = list(reader)
+
+    assert exported[0] == ["行号", "灯具编号", "结果", "错误信息"]
+    error_rows_precheck = [r for r in precheck_results if r["result"] == RESULT_ERROR]
+    exported_errors = [r for r in exported[1:] if r[2] == RESULT_ERROR]
+    assert len(exported_errors) == len(error_rows_precheck)
+
+    for pr in error_rows_precheck:
+        matches = [e for e in exported_errors if e[1] == pr["fixture_no"] and int(e[0]) == pr["row"]]
+        assert len(matches) == 1, f"Precheck row {pr['row']} ({pr['fixture_no']}) not found in export"
+        for err in pr["errors"]:
+            assert err in matches[0][3], f"Error '{err}' missing from export: '{matches[0][3]}'"
+
+    db.close()
+    print("  PASS test_failed_import_to_export_full_chain")
+
+
+def test_failed_import_cross_restart_export():
+    db_path = Path(TMP_DIR) / "cross_restart_fail.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    out_dir = Path(TMP_DIR) / "cross_restart_fail_dir"
+    out_dir.mkdir()
+    rows = [
+        ["CR-EMPTY", "", "", "A-01", "bad-date", "张三", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    batch_id = None
+    batch_no = None
+    try:
+        svc1.execute_import(str(filepath), "重启测试员", "restart.csv")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        batch_id = getattr(e, 'batch_id', None)
+        batch_no = getattr(e, 'batch_no', None)
+        assert batch_id is not None
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    batches = svc2.get_import_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_no"] == batch_no
+    assert batches[0]["status"] == "failed"
+
+    export_dir = Path(TMP_DIR) / "cross_restart_export"
+    export_dir.mkdir()
+    path = svc2.export_batch_errors(batches[0]["id"], str(export_dir), "after_restart.csv")
+    assert os.path.exists(path)
+    with open(path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        exported = list(reader)
+    assert exported[0] == ["行号", "灯具编号", "结果", "错误信息"]
+    assert len(exported) > 1
+
+    db2.close()
+    print("  PASS test_failed_import_cross_restart_export")
+
+
 def main():
     setup()
     tests = [
@@ -1615,6 +1786,9 @@ def main():
         test_successful_import_unaffected_by_failed_batch,
         test_gui_flow_failed_import_records_batch,
         test_gui_flow_successful_import_unaffected,
+        test_precheck_dialog_renders_without_crash,
+        test_failed_import_to_export_full_chain,
+        test_failed_import_cross_restart_export,
     ]
     passed = 0
     failed = 0

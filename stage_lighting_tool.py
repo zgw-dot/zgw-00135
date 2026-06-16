@@ -1317,7 +1317,7 @@ class LightingService:
         if not draft:
             raise ValueError("草稿批次不存在")
 
-        items = self.db.get_selected_draft_items(draft_id)
+        items = self.db.get_draft_items(draft_id)
         conflicts = []
 
         if not filepath:
@@ -1423,6 +1423,12 @@ class LightingService:
                         (c["type"], c["detail"], current_db_snap, c["item_id"]),
                     )
                     self.db.commit()
+                elif existing_status == CONFLICT_STATUS_PENDING:
+                    self.db.execute(
+                        "UPDATE import_draft_items SET conflict_type=?, conflict_detail=?, conflict_status=?, current_db_snapshot=? WHERE id=?",
+                        (c["type"], c["detail"], CONFLICT_STATUS_PENDING, current_db_snap, c["item_id"]),
+                    )
+                    self.db.commit()
                 else:
                     self.db.set_draft_item_conflict(c["item_id"], c["type"], c["detail"], current_db_snap)
 
@@ -1431,7 +1437,11 @@ class LightingService:
                 if item.get("conflict_status") == CONFLICT_STATUS_PENDING:
                     self.db.clear_draft_item_conflict(item_id)
                 elif item.get("conflict_status") in (CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED):
-                    self.db.clear_draft_item_conflict(item_id)
+                    self.db.execute(
+                        "UPDATE import_draft_items SET conflict_type='', conflict_detail='', current_db_snapshot='' WHERE id=?",
+                        (item_id,),
+                    )
+                    self.db.commit()
 
         return conflicts
 
@@ -1442,23 +1452,33 @@ class LightingService:
         fixture_no = item["fixture_no"]
         current = self.db.get_fixture_by_no(fixture_no)
 
+        before_snap_old = json.loads(item["before_snapshot"]) if item["before_snapshot"] else {}
+        after_snap_old = json.loads(item["after_snapshot"]) if item["after_snapshot"] else {}
         record_obj = json.loads(item["record_data"]) if item["record_data"] else {}
 
         if not current:
             new_result = RESULT_NEW
             new_before_snap = ""
-            new_record = dict(record_obj)
-            new_after_snap = json.dumps(new_record, ensure_ascii=False)
-            new_record_data = json.dumps(new_record, ensure_ascii=False)
+            new_after = dict(after_snap_old) if after_snap_old else dict(record_obj)
+            new_after_snap = json.dumps(new_after, ensure_ascii=False)
+            new_record_data = json.dumps(new_after, ensure_ascii=False)
         else:
             new_result = RESULT_UPDATE
             new_before_snap = json.dumps(dict(current), ensure_ascii=False)
-            new_record = dict(record_obj)
-            for field in ["status", "model", "accessories", "location", "inspection_due_date", "person_in_charge", "last_remark"]:
-                if field in current and current.get(field):
-                    new_record[field] = current[field]
-            new_after_snap = json.dumps(new_record, ensure_ascii=False)
-            new_record_data = json.dumps(new_record, ensure_ascii=False)
+
+            conflicting_fields = set()
+            for field in ["status", "model", "accessories", "location", "inspection_due_date", "person_in_charge"]:
+                old_val = before_snap_old.get(field, "")
+                cur_val = current.get(field, "")
+                if old_val != cur_val:
+                    conflicting_fields.add(field)
+
+            new_after = dict(after_snap_old) if after_snap_old else dict(record_obj)
+            for field in conflicting_fields:
+                new_after[field] = current.get(field, "")
+
+            new_after_snap = json.dumps(new_after, ensure_ascii=False)
+            new_record_data = json.dumps(new_after, ensure_ascii=False)
 
         self.db.resolve_draft_item(
             item_id,
@@ -1534,21 +1554,25 @@ class LightingService:
             raise err
 
         selected_items = self.db.get_selected_draft_items(draft_id)
-        if not selected_items:
+        all_draft_items = self.db.get_draft_items(draft_id)
+
+        discarded_items = [it for it in all_draft_items if it.get("resolution_action") == RESOLUTION_ACTION_DISCARD]
+        committed_items = [it for it in selected_items if it.get("resolution_action") != RESOLUTION_ACTION_DISCARD]
+
+        if not committed_items and not discarded_items:
             raise ValueError("没有选中的记录可提交")
 
-        error_items = [it for it in selected_items if it["result"] == RESULT_ERROR]
+        error_items = [it for it in committed_items if it["result"] == RESULT_ERROR]
         if error_items:
             raise ValueError(f"选中的记录中有 {len(error_items)} 条错误记录，请先取消选中或修正后再提交")
 
+        total_record_count = len(committed_items) + len(discarded_items)
         batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
         source_name = draft["source_file"]
 
-        all_draft_items = self.db.get_draft_items(draft_id)
-
         self.db.begin_transaction()
         try:
-            batch_id = self.db.create_import_batch(batch_no, operator, source_name, len(selected_items))
+            batch_id = self.db.create_import_batch(batch_no, operator, source_name, total_record_count)
 
             counts = {RESULT_NEW: 0, RESULT_UPDATE: 0, RESULT_SKIP: 0, RESULT_ERROR: 0}
             resolution_counts = {
@@ -1558,7 +1582,7 @@ class LightingService:
                 "none": 0,
             }
 
-            for item in selected_items:
+            for item in committed_items:
                 fixture_no = item["fixture_no"]
                 result = item["result"]
                 row_idx = item["row_index"]
@@ -1567,7 +1591,6 @@ class LightingService:
 
                 before = json.loads(item["before_snapshot"]) if item["before_snapshot"] else None
                 after_obj = json.loads(item["after_snapshot"]) if item["after_snapshot"] else None
-                record = json.loads(item["record_data"]) if item["record_data"] else {}
 
                 before_snap = item["before_snapshot"]
                 after_snap = ""
@@ -1641,14 +1664,18 @@ class LightingService:
                     batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
                 )
 
-            for item in all_draft_items:
-                if item.get("resolution_action") == RESOLUTION_ACTION_DISCARD:
-                    resolution_counts[RESOLUTION_ACTION_DISCARD] += 1
-                    self.db.add_import_batch_item(
-                        batch_id, item["fixture_no"], item["row_index"], RESULT_SKIP,
-                        f"[放弃] {item.get('resolution_note', '')}".strip(),
-                        item["before_snapshot"], item["after_snapshot"],
-                    )
+            for item in discarded_items:
+                resolution_counts[RESOLUTION_ACTION_DISCARD] += 1
+                note_str = item.get("resolution_note", "")
+                discard_msg = f"[放弃]"
+                if note_str:
+                    discard_msg += f" 备注: {note_str}"
+                self.db.add_import_batch_item(
+                    batch_id, item["fixture_no"], item["row_index"], RESULT_SKIP,
+                    discard_msg,
+                    item["before_snapshot"], item["after_snapshot"],
+                )
+                counts[RESULT_SKIP] += 1
 
             self.db.update_import_batch_counts(
                 batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
@@ -1672,7 +1699,9 @@ class LightingService:
                 "resolution_refresh": resolution_counts[RESOLUTION_ACTION_REFRESH],
                 "resolution_discard": resolution_counts[RESOLUTION_ACTION_DISCARD],
                 "summary": {
-                    "total": len(selected_items),
+                    "total": total_record_count,
+                    "committed": len(committed_items),
+                    "discarded": len(discarded_items),
                     "new": counts[RESULT_NEW],
                     "update": counts[RESULT_UPDATE],
                     "skip": counts[RESULT_SKIP],

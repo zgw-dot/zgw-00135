@@ -19,7 +19,7 @@ from stage_lighting_tool import (
     SETTING_FILTER_LOCATION, SETTING_FILTER_STATUS, SETTING_FILTER_DUE_START, SETTING_FILTER_DUE_END,
     RESULT_NEW, RESULT_UPDATE, RESULT_SKIP, RESULT_ERROR, EXPORT_HEADERS,
     CONFLICT_STATUS_PENDING, CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED,
-    RESOLUTION_ACTION_ORIGINAL, RESOLUTION_ACTION_REFRESH, RESOLUTION_ACTION_DISCARD,
+    RESOLUTION_ACTION_NONE, RESOLUTION_ACTION_ORIGINAL, RESOLUTION_ACTION_REFRESH, RESOLUTION_ACTION_DISCARD,
 )
 
 TMP_DIR = None
@@ -2581,6 +2581,7 @@ def test_draft_conflict_persistence_cross_restart():
     xp004 = items2_by_no["XP004"]
     assert xp004["conflict_status"] == CONFLICT_STATUS_PENDING
     assert xp004["resolution_note"] == "XP004待稍后处理"
+    assert xp004["resolution_action"] == RESOLUTION_ACTION_NONE
 
     db2.close()
     print("  PASS test_draft_conflict_persistence_cross_restart")
@@ -2649,18 +2650,19 @@ def test_draft_conflict_partial_submit():
     assert ps003["status"] == STATUS_MAINTENANCE_FREEZE
 
     detail = svc.get_import_batch_detail(batch_id)
-    assert len(detail["items"]) == 2
+    assert len(detail["items"]) == 3
 
     batch = db.get_import_batch(batch_id)
-    assert "[刷新后提交: 1, 原样提交: 1, 放弃: 1" in batch["error_message"] or "刷新" in batch["error_message"]
+    assert "刷新后提交" in batch["error_message"] or "刷新" in batch["error_message"]
 
     items_by_result = {it["fixture_no"]: it for it in detail["items"]}
     assert "PS001" in items_by_result
     assert "PS002" in items_by_result
-    assert "PS003" not in items_by_result
+    assert "PS003" in items_by_result
 
     assert "[刷新后提交]" in items_by_result["PS001"]["error_message"]
     assert "[原样提交]" in items_by_result["PS002"]["error_message"]
+    assert "[放弃]" in items_by_result["PS003"]["error_message"]
 
     db.close()
     print("  PASS test_draft_conflict_partial_submit")
@@ -2806,6 +2808,102 @@ def test_draft_conflict_export_and_log_consistency():
     print("  PASS test_draft_conflict_export_and_log_consistency")
 
 
+def test_draft_recheck_preserves_resolved_discarded():
+    """提交前复检不吞掉已处理项：刷新/原样/放弃三种决定在重新检测后都完整保留"""
+    svc, db = make_service()
+
+    svc.add_fixture("RC001", "OldR", "", "LocR", "2026-01-01", "PerR")
+    svc.add_fixture("RC002", "OldO", "", "LocO", "2026-01-01", "PerO")
+    svc.add_fixture("RC003", "OldD", "", "LocD", "2026-01-01", "PerD")
+
+    out_dir = Path(TMP_DIR) / "draft_recheck_preserve"
+    out_dir.mkdir()
+    rows = [
+        ["RC001", "NewR", "", "NLocR", "2027-12-01", "NPerR", "", ""],
+        ["RC002", "NewO", "", "NLocO", "2027-12-01", "NPerO", "", ""],
+        ["RC003", "NewD", "", "NLocD", "2027-12-01", "NPerD", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "复检保留测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    db.execute("UPDATE fixtures SET status=?, model=? WHERE fixture_no=?",
+               (STATUS_BORROWED, "DB-Refresh", "RC001"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_INSPECTION_FREEZE, "RC002"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_MAINTENANCE_FREEZE, "RC003"))
+    db.commit()
+
+    svc.detect_and_persist_conflicts(draft_id, str(filepath))
+    items = db.get_draft_items(draft_id)
+    items_by_no = {it["fixture_no"]: it for it in items}
+
+    svc.refresh_draft_item_from_db(items_by_no["RC001"]["id"], "刷新备注RC001")
+    svc.keep_original_draft_item(items_by_no["RC002"]["id"], "原样备注RC002")
+    svc.discard_draft_item(items_by_no["RC003"]["id"], "放弃备注RC003")
+
+    svc.detect_and_persist_conflicts(draft_id, str(filepath))
+
+    items_after_recheck = db.get_draft_items(draft_id)
+    by_no = {it["fixture_no"]: it for it in items_after_recheck}
+
+    rc001 = by_no["RC001"]
+    assert rc001["conflict_status"] == CONFLICT_STATUS_RESOLVED, f"RC001应为已处理，实际为{rc001['conflict_status']}"
+    assert rc001["resolution_action"] == RESOLUTION_ACTION_REFRESH, f"RC001应为刷新，实际为{rc001['resolution_action']}"
+    assert rc001["resolution_note"] == "刷新备注RC001", f"RC001备注丢失，实际为{rc001['resolution_note']}"
+    assert rc001["selected"] == 1
+
+    rc002 = by_no["RC002"]
+    assert rc002["conflict_status"] == CONFLICT_STATUS_RESOLVED, f"RC002应为已处理，实际为{rc002['conflict_status']}"
+    assert rc002["resolution_action"] == RESOLUTION_ACTION_ORIGINAL, f"RC002应为原样，实际为{rc002['resolution_action']}"
+    assert rc002["resolution_note"] == "原样备注RC002", f"RC002备注丢失，实际为{rc002['resolution_note']}"
+    assert rc002["selected"] == 1
+
+    rc003 = by_no["RC003"]
+    assert rc003["conflict_status"] == CONFLICT_STATUS_DISCARDED, f"RC003应为已放弃，实际为{rc003['conflict_status']}"
+    assert rc003["resolution_action"] == RESOLUTION_ACTION_DISCARD, f"RC003应为放弃，实际为{rc003['resolution_action']}"
+    assert rc003["resolution_note"] == "放弃备注RC003", f"RC003备注丢失，实际为{rc003['resolution_note']}"
+    assert rc003["selected"] == 0
+
+    assert svc.has_unresolved_conflicts(draft_id) is False
+
+    result = svc.submit_draft(draft_id, "复检后提交", str(filepath))
+    assert result["success"] is True
+    assert result["resolution_refresh"] == 1
+    assert result["resolution_original"] == 1
+    assert result["resolution_discard"] == 1
+
+    batch_id = result["batch_id"]
+    detail = svc.get_import_batch_detail(batch_id)
+    msg_by_no = {it["fixture_no"]: it["error_message"] for it in detail["items"]}
+    assert "[刷新后提交]" in msg_by_no.get("RC001", ""), f"RC001应为[刷新后提交]，实际为{msg_by_no.get('RC001', '')}"
+    assert "[原样提交]" in msg_by_no.get("RC002", ""), f"RC002应为[原样提交]，实际为{msg_by_no.get('RC002', '')}"
+    assert "[放弃]" in msg_by_no.get("RC003", ""), f"RC003应为[放弃]，实际为{msg_by_no.get('RC003', '')}"
+
+    rc001_db = db.get_fixture_by_no("RC001")
+    after_obj = json.loads(by_no["RC001"]["after_snapshot"])
+    assert rc001_db["status"] == STATUS_BORROWED
+    assert rc001_db["model"] == "DB-Refresh"
+    assert rc001_db["location"] == "NLocR"
+    assert rc001_db["person_in_charge"] == "NPerR"
+
+    rc002_db = db.get_fixture_by_no("RC002")
+    assert rc002_db["model"] == "NewO"
+    assert rc002_db["location"] == "NLocO"
+    assert rc002_db["person_in_charge"] == "NPerO"
+
+    rc003_db = db.get_fixture_by_no("RC003")
+    assert rc003_db["model"] == "OldD"
+    assert rc003_db["status"] == STATUS_MAINTENANCE_FREEZE
+
+    db.close()
+    print("  PASS test_draft_recheck_preserves_resolved_discarded")
+
+
 def main():
     setup()
     tests = [
@@ -2888,6 +2986,7 @@ def main():
         test_draft_conflict_partial_submit,
         test_draft_conflict_unresolved_blocks_submit,
         test_draft_conflict_export_and_log_consistency,
+        test_draft_recheck_preserves_resolved_discarded,
     ]
     passed = 0
     failed = 0

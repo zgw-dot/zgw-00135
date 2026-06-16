@@ -5,6 +5,7 @@ import sqlite3
 import json
 import csv
 import os
+import hashlib
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import date, datetime, timedelta
@@ -155,6 +156,120 @@ INSPECTION_PLAN_IMPORT_FIELD_MAPPING = {
     "处理结果": "result",
     "完成备注": "completion_remark",
     "处理时间": "processed_at",
+}
+
+AUDIT_BATCH_STATUS_IN_PROGRESS = "进行中"
+AUDIT_BATCH_STATUS_COMPLETED = "已完成"
+AUDIT_BATCH_STATUS_CLOSED = "已关闭"
+
+AUDIT_BATCH_ALL_STATUSES = [
+    AUDIT_BATCH_STATUS_IN_PROGRESS,
+    AUDIT_BATCH_STATUS_COMPLETED,
+    AUDIT_BATCH_STATUS_CLOSED,
+]
+
+AUDIT_BATCH_STATUS_COLORS = {
+    AUDIT_BATCH_STATUS_IN_PROGRESS: "#e65100",
+    AUDIT_BATCH_STATUS_COMPLETED: "#2e7d32",
+    AUDIT_BATCH_STATUS_CLOSED: "#616161",
+}
+
+AUDIT_DIFF_TYPE_NORMAL = "正常"
+AUDIT_DIFF_TYPE_MISSING = "缺失"
+AUDIT_DIFF_TYPE_SERIAL_MISMATCH = "串号不符"
+AUDIT_DIFF_TYPE_STATUS_ABNORMAL = "状态异常"
+
+AUDIT_DIFF_ALL_TYPES = [
+    AUDIT_DIFF_TYPE_NORMAL,
+    AUDIT_DIFF_TYPE_MISSING,
+    AUDIT_DIFF_TYPE_SERIAL_MISMATCH,
+    AUDIT_DIFF_TYPE_STATUS_ABNORMAL,
+]
+
+AUDIT_DIFF_TYPE_COLORS = {
+    AUDIT_DIFF_TYPE_NORMAL: "#2e7d32",
+    AUDIT_DIFF_TYPE_MISSING: "#c62828",
+    AUDIT_DIFF_TYPE_SERIAL_MISMATCH: "#e65100",
+    AUDIT_DIFF_TYPE_STATUS_ABNORMAL: "#1565c0",
+}
+
+AUDIT_RESOLUTION_STATUS_PENDING = "待处理"
+AUDIT_RESOLUTION_STATUS_CONFIRMED = "已确认"
+AUDIT_RESOLUTION_STATUS_WITHDRAWN = "已撤回"
+
+AUDIT_RESOLUTION_ALL_STATUSES = [
+    AUDIT_RESOLUTION_STATUS_PENDING,
+    AUDIT_RESOLUTION_STATUS_CONFIRMED,
+    AUDIT_RESOLUTION_STATUS_WITHDRAWN,
+]
+
+AUDIT_RESOLUTION_STATUS_COLORS = {
+    AUDIT_RESOLUTION_STATUS_PENDING: "#e65100",
+    AUDIT_RESOLUTION_STATUS_CONFIRMED: "#2e7d32",
+    AUDIT_RESOLUTION_STATUS_WITHDRAWN: "#9e9e9e",
+}
+
+AUDIT_BATCH_TABLE_COLUMNS = [
+    ("id", "ID", 40),
+    ("batch_no", "批次号", 130),
+    ("category", "分类依据", 80),
+    ("category_value", "分类值", 100),
+    ("creator", "创建人", 80),
+    ("current_handler", "当前处理人", 90),
+    ("status", "批次状态", 80),
+    ("total_items", "总数", 50),
+    ("diff_count", "差异数", 60),
+    ("resolved_count", "已处理", 60),
+    ("created_at", "创建时间", 140),
+]
+
+AUDIT_ITEM_TABLE_COLUMNS = [
+    ("id", "ID", 40),
+    ("batch_id", "批次ID", 50),
+    ("fixture_no", "灯具编号", 90),
+    ("book_model", "账面型号", 100),
+    ("actual_model", "实盘型号", 100),
+    ("book_status", "账面状态", 80),
+    ("actual_status", "实盘状态", 80),
+    ("book_location", "账面库位", 80),
+    ("actual_location", "实盘库位", 80),
+    ("diff_type", "差异类型", 80),
+    ("resolution_status", "处理状态", 80),
+    ("handler", "处理人", 80),
+    ("resolution_opinion", "处理意见", 160),
+    ("resolved_at", "处理时间", 140),
+    ("remark", "备注", 160),
+]
+
+AUDIT_ITEM_EXPORT_FIELDS = [
+    "batch_no", "fixture_no", "book_model", "actual_model",
+    "book_status", "actual_status", "book_location", "actual_location",
+    "diff_type", "resolution_status", "handler", "resolution_opinion",
+    "resolved_at", "remark",
+]
+AUDIT_ITEM_EXPORT_HEADERS = [
+    "盘点批次号", "灯具编号", "账面型号", "实盘型号",
+    "账面状态", "实盘状态", "账面库位", "实盘库位",
+    "差异类型", "处理状态", "处理人", "处理意见",
+    "处理时间", "备注",
+]
+
+AUDIT_IMPORT_REQUIRED_FIELDS = ["fixture_no"]
+AUDIT_IMPORT_FIELD_MAPPING = {
+    "灯具编号": "fixture_no",
+    "实盘型号": "actual_model",
+    "实盘状态": "actual_status",
+    "实盘库位": "actual_location",
+    "备注": "remark",
+}
+
+AUDIT_ACTUAL_COUNT_IMPORT_REQUIRED_FIELDS = ["fixture_no"]
+AUDIT_ACTUAL_COUNT_IMPORT_FIELD_MAPPING = {
+    "灯具编号": "fixture_no",
+    "实盘型号": "actual_model",
+    "实盘状态": "actual_status",
+    "实盘库位": "actual_location",
+    "备注": "remark",
 }
 
 
@@ -315,6 +430,74 @@ class DatabaseManager:
                 FOREIGN KEY (plan_id) REFERENCES inspection_plans(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_inspection_plan_history_plan ON inspection_plan_history(plan_id);
+            CREATE TABLE IF NOT EXISTS audit_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT UNIQUE NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                category_value TEXT NOT NULL DEFAULT '',
+                creator TEXT NOT NULL DEFAULT '',
+                current_handler TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '进行中',
+                total_items INTEGER NOT NULL DEFAULT 0,
+                diff_count INTEGER NOT NULL DEFAULT 0,
+                resolved_count INTEGER NOT NULL DEFAULT 0,
+                source_file TEXT NOT NULL DEFAULT '',
+                source_file_hash TEXT NOT NULL DEFAULT '',
+                import_log TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_batches_no ON audit_batches(batch_no);
+            CREATE INDEX IF NOT EXISTS idx_audit_batches_status ON audit_batches(status);
+            CREATE INDEX IF NOT EXISTS idx_audit_batches_creator ON audit_batches(creator);
+            CREATE INDEX IF NOT EXISTS idx_audit_batches_handler ON audit_batches(current_handler);
+            CREATE TABLE IF NOT EXISTS audit_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                fixture_no TEXT NOT NULL,
+                book_model TEXT NOT NULL DEFAULT '',
+                actual_model TEXT NOT NULL DEFAULT '',
+                book_status TEXT NOT NULL DEFAULT '',
+                actual_status TEXT NOT NULL DEFAULT '',
+                book_location TEXT NOT NULL DEFAULT '',
+                actual_location TEXT NOT NULL DEFAULT '',
+                diff_type TEXT NOT NULL DEFAULT '正常',
+                resolution_status TEXT NOT NULL DEFAULT '待处理',
+                handler TEXT NOT NULL DEFAULT '',
+                resolution_opinion TEXT NOT NULL DEFAULT '',
+                resolved_at TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (batch_id) REFERENCES audit_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_items_batch ON audit_items(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_items_fno ON audit_items(fixture_no);
+            CREATE INDEX IF NOT EXISTS idx_audit_items_diff ON audit_items(diff_type);
+            CREATE INDEX IF NOT EXISTS idx_audit_items_resolution ON audit_items(resolution_status);
+            CREATE INDEX IF NOT EXISTS idx_audit_items_handler ON audit_items(handler);
+            CREATE TABLE IF NOT EXISTS audit_handover_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                from_handler TEXT NOT NULL DEFAULT '',
+                to_handler TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (batch_id) REFERENCES audit_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_handover_batch ON audit_handover_log(batch_id);
+            CREATE TABLE IF NOT EXISTS audit_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT NOT NULL DEFAULT '',
+                to_status TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (batch_id) REFERENCES audit_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_history_batch ON audit_history(batch_id);
         """)
         try:
             self.conn.execute("ALTER TABLE import_draft_batches ADD COLUMN source_file_path TEXT NOT NULL DEFAULT ''")
@@ -757,6 +940,175 @@ class DatabaseManager:
                     "INSERT INTO inspection_plans (fixture_id, fixture_no, model, plan_date, planner, executor, status) VALUES (?,?,?,?,?,?,'待巡检')",
                     (p["fixture_id"], p["fixture_no"], p.get("model", ""),
                      p["plan_date"], p["planner"], p.get("executor", "")),
+                )
+            self.commit()
+        except Exception:
+            self.rollback_transaction()
+            raise
+
+    def create_audit_batch(self, batch_no, category, category_value, creator, source_file="", source_file_hash=""):
+        cur = self.execute(
+            "INSERT INTO audit_batches (batch_no, category, category_value, creator, current_handler, status, source_file, source_file_hash) VALUES (?,?,?,?,?,?,?,?)",
+            (batch_no, category, category_value, creator, creator, AUDIT_BATCH_STATUS_IN_PROGRESS, source_file, source_file_hash),
+        )
+        self.commit()
+        return cur.lastrowid
+
+    def get_audit_batch(self, batch_id):
+        row = self.execute("SELECT * FROM audit_batches WHERE id=?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_audit_batch_by_no(self, batch_no):
+        row = self.execute("SELECT * FROM audit_batches WHERE batch_no=?", (batch_no,)).fetchone()
+        return dict(row) if row else None
+
+    def update_audit_batch(self, batch_id, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [batch_id]
+        self.execute(f"UPDATE audit_batches SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+        self.commit()
+
+    def delete_audit_batch(self, batch_id):
+        self.execute("DELETE FROM audit_items WHERE batch_id=?", (batch_id,))
+        self.execute("DELETE FROM audit_handover_log WHERE batch_id=?", (batch_id,))
+        self.execute("DELETE FROM audit_history WHERE batch_id=?", (batch_id,))
+        self.execute("DELETE FROM audit_batches WHERE id=?", (batch_id,))
+        self.commit()
+
+    def query_audit_batches(self, status=None, handler=None, creator=None, date_start=None, date_end=None):
+        sql = "SELECT * FROM audit_batches WHERE 1=1"
+        params = []
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        if handler:
+            sql += " AND current_handler=?"
+            params.append(handler)
+        if creator:
+            sql += " AND creator=?"
+            params.append(creator)
+        if date_start:
+            sql += " AND created_at>=?"
+            params.append(date_start)
+        if date_end:
+            sql += " AND created_at<=?"
+            params.append(date_end)
+        sql += " ORDER BY created_at DESC"
+        return [dict(r) for r in self.execute(sql, params).fetchall()]
+
+    def add_audit_item(self, batch_id, fixture_no, book_model, actual_model,
+                       book_status, actual_status, book_location, actual_location,
+                       diff_type, remark=""):
+        cur = self.execute(
+            "INSERT INTO audit_items (batch_id, fixture_no, book_model, actual_model, book_status, actual_status, book_location, actual_location, diff_type, remark) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (batch_id, fixture_no, book_model, actual_model, book_status, actual_status, book_location, actual_location, diff_type, remark),
+        )
+        self.commit()
+        return cur.lastrowid
+
+    def get_audit_item(self, item_id):
+        row = self.execute("SELECT * FROM audit_items WHERE id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_audit_items_by_batch(self, batch_id):
+        rows = self.execute("SELECT * FROM audit_items WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_audit_item(self, item_id, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [item_id]
+        self.execute(f"UPDATE audit_items SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+        self.commit()
+
+    def query_audit_items(self, batch_id=None, diff_type=None, resolution_status=None, handler=None):
+        sql = "SELECT * FROM audit_items WHERE 1=1"
+        params = []
+        if batch_id:
+            sql += " AND batch_id=?"
+            params.append(batch_id)
+        if diff_type:
+            sql += " AND diff_type=?"
+            params.append(diff_type)
+        if resolution_status:
+            sql += " AND resolution_status=?"
+            params.append(resolution_status)
+        if handler:
+            sql += " AND handler=?"
+            params.append(handler)
+        sql += " ORDER BY id"
+        return [dict(r) for r in self.execute(sql, params).fetchall()]
+
+    def count_audit_items_by_diff_type(self, batch_id):
+        rows = self.execute(
+            "SELECT diff_type, COUNT(*) as cnt FROM audit_items WHERE batch_id=? GROUP BY diff_type",
+            (batch_id,),
+        ).fetchall()
+        return {r["diff_type"]: r["cnt"] for r in rows}
+
+    def count_audit_items_by_resolution_status(self, batch_id):
+        rows = self.execute(
+            "SELECT resolution_status, COUNT(*) as cnt FROM audit_items WHERE batch_id=? GROUP BY resolution_status",
+            (batch_id,),
+        ).fetchall()
+        return {r["resolution_status"]: r["cnt"] for r in rows}
+
+    def add_audit_handover(self, batch_id, from_handler, to_handler, reason):
+        self.execute(
+            "INSERT INTO audit_handover_log (batch_id, from_handler, to_handler, reason) VALUES (?,?,?,?)",
+            (batch_id, from_handler, to_handler, reason),
+        )
+        self.execute(
+            "UPDATE audit_batches SET current_handler=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (to_handler, batch_id),
+        )
+        self.commit()
+
+    def get_audit_handover_log(self, batch_id):
+        rows = self.execute(
+            "SELECT * FROM audit_handover_log WHERE batch_id=? ORDER BY created_at",
+            (batch_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_audit_history(self, batch_id, action, from_status, to_status, operator, remark=""):
+        self.execute(
+            "INSERT INTO audit_history (batch_id, action, from_status, to_status, operator, remark) VALUES (?,?,?,?,?,?)",
+            (batch_id, action, from_status, to_status, operator, remark),
+        )
+        self.commit()
+
+    def get_audit_history(self, batch_id):
+        return [dict(r) for r in self.execute(
+            "SELECT * FROM audit_history WHERE batch_id=? ORDER BY created_at DESC",
+            (batch_id,),
+        ).fetchall()]
+
+    def get_all_audit_handlers(self):
+        rows = self.execute(
+            "SELECT DISTINCT current_handler FROM audit_batches WHERE current_handler!='' ORDER BY current_handler"
+        ).fetchall()
+        handlers = [r["current_handler"] for r in rows]
+        creator_rows = self.execute(
+            "SELECT DISTINCT creator FROM audit_batches WHERE creator!='' ORDER BY creator"
+        ).fetchall()
+        for r in creator_rows:
+            if r["creator"] not in handlers:
+                handlers.append(r["creator"])
+        return sorted(handlers)
+
+    def batch_insert_audit_items(self, items):
+        self.begin_transaction()
+        try:
+            for item in items:
+                self.execute(
+                    "INSERT INTO audit_items (batch_id, fixture_no, book_model, actual_model, book_status, actual_status, book_location, actual_location, diff_type, remark) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (item["batch_id"], item["fixture_no"], item["book_model"], item["actual_model"],
+                     item["book_status"], item["actual_status"], item["book_location"], item["actual_location"],
+                     item["diff_type"], item.get("remark", "")),
                 )
             self.commit()
         except Exception:
@@ -2571,6 +2923,377 @@ class LightingService:
             "plan_ids": created_ids,
         }
 
+    def _compute_diff_type(self, book_model, actual_model, book_status, actual_status):
+        if not actual_model and not actual_status:
+            return AUDIT_DIFF_TYPE_MISSING
+        diffs = []
+        if actual_model and book_model != actual_model:
+            diffs.append(AUDIT_DIFF_TYPE_SERIAL_MISMATCH)
+        if actual_status and book_status != actual_status:
+            diffs.append(AUDIT_DIFF_TYPE_STATUS_ABNORMAL)
+        if diffs:
+            return diffs[0]
+        return AUDIT_DIFF_TYPE_NORMAL
+
+    def create_audit_batch(self, category, category_value, creator, location_filter=None, model_filter=None, status_filter=None):
+        if not creator:
+            raise ValueError("创建人不能为空")
+        if not category:
+            raise ValueError("分类依据不能为空")
+        if category not in ("库位", "设备分类", "日期"):
+            raise ValueError("分类依据必须是: 库位、设备分类 或 日期")
+
+        batch_no = f"PD{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
+
+        kwargs = {}
+        if location_filter:
+            kwargs["location"] = location_filter
+        if status_filter:
+            kwargs["status"] = status_filter
+
+        fixtures = self.db.query_fixtures(**kwargs)
+        if model_filter:
+            fixtures = [f for f in fixtures if f["model"] == model_filter]
+
+        if not fixtures:
+            raise ValueError("没有符合条件的灯具")
+
+        batch_id = self.db.create_audit_batch(batch_no, category, category_value, creator)
+
+        items = []
+        for f in fixtures:
+            items.append({
+                "batch_id": batch_id,
+                "fixture_no": f["fixture_no"],
+                "book_model": f["model"],
+                "actual_model": "",
+                "book_status": f["status"],
+                "actual_status": "",
+                "book_location": f["location"],
+                "actual_location": "",
+                "diff_type": AUDIT_DIFF_TYPE_NORMAL,
+                "remark": "",
+            })
+
+        self.db.batch_insert_audit_items(items)
+
+        total_items = len(items)
+        self.db.update_audit_batch(batch_id, total_items=total_items)
+        self.db.add_audit_history(batch_id, "创建盘点批次", "", AUDIT_BATCH_STATUS_IN_PROGRESS, creator,
+                                  f"分类依据: {category}={category_value}, 共 {total_items} 项")
+
+        return {
+            "batch_id": batch_id,
+            "batch_no": batch_no,
+            "total_items": total_items,
+        }
+
+    def import_actual_count_csv(self, batch_id, filepath, operator):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+
+        file_hash = hashlib.md5(open(filepath, "rb").read()).hexdigest()
+        if batch["source_file_hash"] and batch["source_file_hash"] == file_hash:
+            log_entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 操作人={operator} 尝试重复导入同一文件(哈希={file_hash})，已拦截"
+            existing_log = batch.get("import_log", "")
+            self.db.update_audit_batch(batch_id, import_log=existing_log + "\n" + log_entry)
+            self.db.add_audit_history(batch_id, "重复导入拦截", batch["status"], batch["status"], operator,
+                                      f"文件哈希 {file_hash} 与已有记录相同，拒绝重复导入")
+            raise ValueError("该文件已导入过此批次，不允许重复导入")
+
+        records = self._parse_actual_count_csv(filepath)
+        if not records:
+            raise ValueError("文件中没有可导入的记录")
+
+        existing_items = self.db.get_audit_items_by_batch(batch_id)
+        item_by_fno = {item["fixture_no"]: item for item in existing_items}
+
+        updated_count = 0
+        not_found_count = 0
+        diff_count = 0
+
+        for rec in records:
+            fixture_no = rec.get("fixture_no", "")
+            if not fixture_no:
+                continue
+            item = item_by_fno.get(fixture_no)
+            if not item:
+                not_found_count += 1
+                continue
+
+            actual_model = rec.get("actual_model", "")
+            actual_status = rec.get("actual_status", "")
+            actual_location = rec.get("actual_location", "")
+            remark = rec.get("remark", "") or item["remark"]
+
+            diff_type = self._compute_diff_type(item["book_model"], actual_model, item["book_status"], actual_status)
+            if actual_location and item["book_location"] != actual_location:
+                if diff_type == AUDIT_DIFF_TYPE_NORMAL:
+                    diff_type = AUDIT_DIFF_TYPE_STATUS_ABNORMAL
+
+            self.db.update_audit_item(item["id"],
+                                      actual_model=actual_model,
+                                      actual_status=actual_status,
+                                      actual_location=actual_location,
+                                      diff_type=diff_type,
+                                      remark=remark)
+            updated_count += 1
+            if diff_type != AUDIT_DIFF_TYPE_NORMAL:
+                diff_count += 1
+
+        diff_type_counts = self.db.count_audit_items_by_diff_type(batch_id)
+        total_diff = sum(c for t, c in diff_type_counts.items() if t != AUDIT_DIFF_TYPE_NORMAL)
+
+        self.db.update_audit_batch(batch_id,
+                                   diff_count=total_diff,
+                                   source_file=Path(filepath).name,
+                                   source_file_hash=file_hash)
+
+        self.db.add_audit_history(batch_id, "导入实盘数据", batch["status"], batch["status"], operator,
+                                  f"导入 {updated_count} 条, 差异 {diff_count} 条, 未匹配 {not_found_count} 条")
+
+        return {
+            "updated": updated_count,
+            "diff_count": diff_count,
+            "not_found": not_found_count,
+        }
+
+    def _parse_actual_count_csv(self, filepath):
+        records = []
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+        except UnicodeDecodeError:
+            with open(filepath, "r", encoding="gbk") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+
+        if not rows:
+            raise ValueError("CSV 文件为空")
+
+        header_row = rows[0]
+        field_map = {}
+        for i, col in enumerate(header_row):
+            col_stripped = col.strip()
+            if col_stripped in AUDIT_ACTUAL_COUNT_IMPORT_FIELD_MAPPING:
+                field_map[i] = AUDIT_ACTUAL_COUNT_IMPORT_FIELD_MAPPING[col_stripped]
+
+        if "fixture_no" not in field_map.values():
+            raise ValueError("CSV 文件缺少必要列：灯具编号")
+
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if not any(cell.strip() for cell in row):
+                continue
+            record = {}
+            for col_idx, value in enumerate(row):
+                if col_idx in field_map:
+                    record[field_map[col_idx]] = value.strip()
+            records.append(record)
+
+        return records
+
+    def get_audit_batch(self, batch_id):
+        return self.db.get_audit_batch(batch_id)
+
+    def get_audit_batches(self, **filters):
+        return self.db.query_audit_batches(**filters)
+
+    def get_audit_items_by_batch(self, batch_id):
+        items = self.db.get_audit_items_by_batch(batch_id)
+        batch = self.db.get_audit_batch(batch_id)
+        if batch:
+            for item in items:
+                item["batch_no"] = batch["batch_no"]
+        return items
+
+    def get_audit_items_filtered(self, batch_id=None, diff_type=None, resolution_status=None, handler=None):
+        return self.db.query_audit_items(batch_id=batch_id, diff_type=diff_type,
+                                          resolution_status=resolution_status, handler=handler)
+
+    def confirm_audit_item(self, item_id, operator, resolution_opinion="", remark=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        item = self.db.get_audit_item(item_id)
+        if not item:
+            raise ValueError("盘点条目不存在")
+
+        batch = self.db.get_audit_batch(item["batch_id"])
+        if not batch:
+            raise ValueError("所属盘点批次不存在")
+
+        if operator != batch["creator"] and operator != batch["current_handler"]:
+            raise ValueError(f"只有创建人「{batch['creator']}」或当前处理人「{batch['current_handler']}」才能确认处理")
+
+        if item["resolution_status"] == AUDIT_RESOLUTION_STATUS_CONFIRMED:
+            raise ValueError("该条目已确认，请勿重复操作")
+
+        old_status = item["resolution_status"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.update_audit_item(item_id,
+                                  resolution_status=AUDIT_RESOLUTION_STATUS_CONFIRMED,
+                                  handler=operator,
+                                  resolution_opinion=resolution_opinion,
+                                  resolved_at=now,
+                                  remark=remark)
+
+        resolved_counts = self.db.count_audit_items_by_resolution_status(item["batch_id"])
+        resolved = resolved_counts.get(AUDIT_RESOLUTION_STATUS_CONFIRMED, 0)
+        self.db.update_audit_batch(item["batch_id"], resolved_count=resolved)
+        self.db.add_audit_history(item["batch_id"], "确认处理", old_status, AUDIT_RESOLUTION_STATUS_CONFIRMED,
+                                  operator, f"条目 {item['fixture_no']}: {resolution_opinion or '无意见'}")
+
+    def withdraw_audit_confirmation(self, item_id, operator, reason=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        item = self.db.get_audit_item(item_id)
+        if not item:
+            raise ValueError("盘点条目不存在")
+
+        batch = self.db.get_audit_batch(item["batch_id"])
+        if not batch:
+            raise ValueError("所属盘点批次不存在")
+
+        if operator != batch["creator"] and operator != batch["current_handler"]:
+            raise ValueError(f"只有创建人「{batch['creator']}」或当前处理人「{batch['current_handler']}」才能撤回确认")
+
+        if item["resolution_status"] != AUDIT_RESOLUTION_STATUS_CONFIRMED:
+            raise ValueError("只有已确认的条目才能撤回")
+
+        old_status = item["resolution_status"]
+        self.db.update_audit_item(item_id,
+                                  resolution_status=AUDIT_RESOLUTION_STATUS_WITHDRAWN,
+                                  handler="",
+                                  resolution_opinion="",
+                                  resolved_at="",
+                                  remark=f"撤回原因: {reason or '未填写'}")
+
+        resolved_counts = self.db.count_audit_items_by_resolution_status(item["batch_id"])
+        resolved = resolved_counts.get(AUDIT_RESOLUTION_STATUS_CONFIRMED, 0)
+        self.db.update_audit_batch(item["batch_id"], resolved_count=resolved)
+        self.db.add_audit_history(item["batch_id"], "撤回确认", old_status, AUDIT_RESOLUTION_STATUS_WITHDRAWN,
+                                  operator, f"条目 {item['fixture_no']}: 撤回原因={reason or '未填写'}")
+
+    def handover_audit_batch(self, batch_id, from_handler, to_handler, reason):
+        if not to_handler:
+            raise ValueError("接手人不能为空")
+        if not reason:
+            raise ValueError("接手原因不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+        if batch["current_handler"] != from_handler:
+            raise ValueError(f"只有当前处理人「{batch['current_handler']}」才能接手交接")
+
+        self.db.add_audit_handover(batch_id, from_handler, to_handler, reason)
+        self.db.add_audit_history(batch_id, "接手交接", from_handler, to_handler, from_handler,
+                                  f"接手原因: {reason}")
+
+    def check_audit_permission(self, batch_id, operator):
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            return False
+        return operator == batch["creator"] or operator == batch["current_handler"]
+
+    def close_audit_batch(self, batch_id, operator, reason=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+        if batch["status"] == AUDIT_BATCH_STATUS_CLOSED:
+            raise ValueError("该批次已关闭")
+        if operator != batch["creator"] and operator != batch["current_handler"]:
+            raise ValueError("只有创建人或当前处理人才能关闭批次")
+
+        old_status = batch["status"]
+        self.db.update_audit_batch(batch_id, status=AUDIT_BATCH_STATUS_CLOSED)
+        self.db.add_audit_history(batch_id, "关闭批次", old_status, AUDIT_BATCH_STATUS_CLOSED, operator,
+                                  reason or "未填写")
+
+    def complete_audit_batch(self, batch_id, operator, reason=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+        if batch["status"] != AUDIT_BATCH_STATUS_IN_PROGRESS:
+            raise ValueError("只有进行中的批次才能标记完成")
+
+        if operator != batch["creator"] and operator != batch["current_handler"]:
+            raise ValueError("只有创建人或当前处理人才能标记完成")
+
+        old_status = batch["status"]
+        self.db.update_audit_batch(batch_id, status=AUDIT_BATCH_STATUS_COMPLETED)
+        self.db.add_audit_history(batch_id, "标记完成", old_status, AUDIT_BATCH_STATUS_COMPLETED, operator,
+                                  reason or "未填写")
+
+    def reopen_audit_batch(self, batch_id, operator, reason=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+        if batch["status"] != AUDIT_BATCH_STATUS_COMPLETED:
+            raise ValueError("只有已完成的批次才能重新开启")
+        if operator != batch["creator"] and operator != batch["current_handler"]:
+            raise ValueError("只有创建人或当前处理人才能重新开启")
+
+        old_status = batch["status"]
+        self.db.update_audit_batch(batch_id, status=AUDIT_BATCH_STATUS_IN_PROGRESS)
+        self.db.add_audit_history(batch_id, "重新开启", old_status, AUDIT_BATCH_STATUS_IN_PROGRESS, operator,
+                                  reason or "未填写")
+
+    def get_audit_history(self, batch_id):
+        return self.db.get_audit_history(batch_id)
+
+    def get_audit_handover_log(self, batch_id):
+        return self.db.get_audit_handover_log(batch_id)
+
+    def get_all_audit_handlers(self):
+        return self.db.get_all_audit_handlers()
+
+    def export_audit_items_csv(self, items, directory, filename):
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"导出目录 '{directory}' 不可写，请选择其他目录")
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(AUDIT_ITEM_EXPORT_HEADERS)
+            for item in items:
+                writer.writerow([item.get(k, "") for k in AUDIT_ITEM_EXPORT_FIELDS])
+        return str(filepath)
+
+    def export_audit_template(self, directory, filename):
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+            writer.writerow(["L001", "PAR64", "可用", "A-1", ""])
+            writer.writerow(["L002", "LED200", "借出", "A-2", ""])
+        return str(filepath)
+
+    def delete_audit_batch(self, batch_id, operator):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        batch = self.db.get_audit_batch(batch_id)
+        if not batch:
+            raise ValueError("盘点批次不存在")
+        if operator != batch["creator"]:
+            raise ValueError("只有创建人才能删除批次")
+        self.db.delete_audit_batch(batch_id)
+
 
 class FormDialog(tk.Toplevel):
     def __init__(self, parent, title, fields, initial=None, width=360):
@@ -4302,6 +5025,565 @@ class InspectionPlanPrecheckDialog(tk.Toplevel):
         self.destroy()
 
 
+class InventoryAuditDialog(tk.Toplevel):
+    def __init__(self, parent, service):
+        super().__init__(parent)
+        self.service = service
+        self.title("盘点差异工单")
+        self.geometry("1200x760")
+        self.minsize(1000, 650)
+        self.resizable(True, True)
+        self.transient(parent)
+
+        self._current_batch_filters = {}
+        self._current_item_filters = {}
+        self._selected_batch_id = None
+        self._selected_item_id = None
+        self._current_operator = ""
+
+        self._build_operator_bar()
+        self._build_toolbar()
+        self._build_filter_panel()
+        self._build_main_area()
+        self._build_status_bar()
+        self._refresh_batches()
+
+    def _build_operator_bar(self):
+        frame = ttk.Frame(self, padding=(8, 4))
+        frame.pack(fill="x")
+        ttk.Label(frame, text="当前操作人:").pack(side="left", padx=(0, 4))
+        self.operator_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.operator_var, width=16).pack(side="left", padx=(0, 12))
+        ttk.Label(frame, text="(确认处理/接手等操作需要填写操作人)", foreground="gray").pack(side="left")
+
+    def _build_toolbar(self):
+        toolbar = ttk.Frame(self, padding=(8, 6))
+        toolbar.pack(fill="x")
+
+        ttk.Button(toolbar, text="创建盘点批次...", command=self._on_create_batch, width=14).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="删除批次", command=self._on_delete_batch, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="导入实盘清单...", command=self._on_import_actual, width=14).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="导出差异结果...", command=self._on_export, width=14).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="导出导入模板...", command=self._on_export_template, width=14).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="确认处理", command=self._on_confirm_item, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="撤回确认", command=self._on_withdraw_item, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="接手交接...", command=self._on_handover, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="标记完成", command=self._on_complete_batch, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="重新开启", command=self._on_reopen_batch, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="关闭批次", command=self._on_close_batch, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="刷新", command=self._refresh_batches, width=8).pack(side="left", padx=2)
+
+    def _build_filter_panel(self):
+        frame = ttk.LabelFrame(self, text="筛选", padding=6)
+        frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        ttk.Label(frame, text="批次状态:").grid(row=0, column=0, padx=(0, 4), pady=2)
+        self.filter_batch_status = ttk.Combobox(frame, width=10, values=[""] + AUDIT_BATCH_ALL_STATUSES)
+        self.filter_batch_status.grid(row=0, column=1, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="负责人:").grid(row=0, column=2, padx=(0, 4), pady=2)
+        self.filter_handler = ttk.Combobox(frame, width=10, values=[""] + self.service.get_all_audit_handlers())
+        self.filter_handler.grid(row=0, column=3, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="创建起始:").grid(row=0, column=4, padx=(0, 4), pady=2)
+        self.filter_date_start = ttk.Entry(frame, width=11)
+        self.filter_date_start.grid(row=0, column=5, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="创建结束:").grid(row=0, column=6, padx=(0, 4), pady=2)
+        self.filter_date_end = ttk.Entry(frame, width=11)
+        self.filter_date_end.grid(row=0, column=7, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="差异类型:").grid(row=0, column=8, padx=(0, 4), pady=2)
+        self.filter_diff_type = ttk.Combobox(frame, width=10, values=[""] + AUDIT_DIFF_ALL_TYPES)
+        self.filter_diff_type.grid(row=0, column=9, padx=(0, 12), pady=2)
+
+        ttk.Button(frame, text="筛选", command=self._on_filter).grid(row=0, column=10, padx=4, pady=2)
+        ttk.Button(frame, text="重置", command=self._on_reset_filter).grid(row=0, column=11, padx=4, pady=2)
+
+    def _build_main_area(self):
+        main = ttk.PanedWindow(self, orient="vertical")
+        main.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        top_frame = ttk.LabelFrame(main, text="盘点批次", padding=4)
+        main.add(top_frame, weight=2)
+
+        batch_cols = [c[0] for c in AUDIT_BATCH_TABLE_COLUMNS]
+        self.batch_tree = ttk.Treeview(top_frame, columns=batch_cols, show="headings", selectmode="browse")
+        for col_id, col_name, col_w in AUDIT_BATCH_TABLE_COLUMNS:
+            self.batch_tree.heading(col_id, text=col_name, anchor="center")
+            self.batch_tree.column(col_id, width=col_w, minwidth=40, anchor="center")
+
+        for status_name in AUDIT_BATCH_ALL_STATUSES:
+            self.batch_tree.tag_configure(status_name, foreground=AUDIT_BATCH_STATUS_COLORS.get(status_name, "black"))
+
+        bvsb = ttk.Scrollbar(top_frame, orient="vertical", command=self.batch_tree.yview)
+        self.batch_tree.configure(yscrollcommand=bvsb.set)
+        self.batch_tree.pack(side="left", fill="both", expand=True)
+        bvsb.pack(side="right", fill="y")
+        self.batch_tree.bind("<<TreeviewSelect>>", self._on_batch_select)
+
+        bottom_pane = ttk.PanedWindow(main, orient="horizontal")
+        main.add(bottom_pane, weight=3)
+
+        items_frame = ttk.LabelFrame(bottom_pane, text="差异明细", padding=4)
+        bottom_pane.add(items_frame, weight=3)
+
+        item_cols = [c[0] for c in AUDIT_ITEM_TABLE_COLUMNS]
+        self.item_tree = ttk.Treeview(items_frame, columns=item_cols, show="headings", selectmode="browse")
+        for col_id, col_name, col_w in AUDIT_ITEM_TABLE_COLUMNS:
+            self.item_tree.heading(col_id, text=col_name, anchor="center")
+            self.item_tree.column(col_id, width=col_w, minwidth=40, anchor="center")
+
+        for diff_type in AUDIT_DIFF_ALL_TYPES:
+            self.item_tree.tag_configure(diff_type, foreground=AUDIT_DIFF_TYPE_COLORS.get(diff_type, "black"))
+        for res_status in AUDIT_RESOLUTION_ALL_STATUSES:
+            self.item_tree.tag_configure(res_status, foreground=AUDIT_RESOLUTION_STATUS_COLORS.get(res_status, "black"))
+
+        ivsb = ttk.Scrollbar(items_frame, orient="vertical", command=self.item_tree.yview)
+        ihsb = ttk.Scrollbar(items_frame, orient="horizontal", command=self.item_tree.xview)
+        self.item_tree.configure(yscrollcommand=ivsb.set, xscrollcommand=ihsb.set)
+        self.item_tree.pack(side="left", fill="both", expand=True)
+        ivsb.pack(side="right", fill="y")
+        ihsb.pack(side="bottom", fill="x")
+        self.item_tree.bind("<<TreeviewSelect>>", self._on_item_select)
+
+        right_frame = ttk.Frame(bottom_pane)
+        bottom_pane.add(right_frame, weight=2)
+
+        hist_frame = ttk.LabelFrame(right_frame, text="批次历史", padding=4)
+        hist_frame.pack(fill="both", expand=True, pady=(0, 4))
+
+        hist_cols = ("time", "action", "change", "operator", "remark")
+        self.hist_tree = ttk.Treeview(hist_frame, columns=hist_cols, show="headings", height=6)
+        hist_config = [("time", "时间", 140), ("action", "操作", 100),
+                       ("change", "变更", 120), ("operator", "操作人", 80),
+                       ("remark", "备注", 200)]
+        for cid, cname, cw in hist_config:
+            self.hist_tree.heading(cid, text=cname, anchor="center")
+            self.hist_tree.column(cid, width=cw, minwidth=40, anchor="w")
+
+        hvsb = ttk.Scrollbar(hist_frame, orient="vertical", command=self.hist_tree.yview)
+        self.hist_tree.configure(yscrollcommand=hvsb.set)
+        self.hist_tree.pack(side="left", fill="both", expand=True)
+        hvsb.pack(side="right", fill="y")
+
+        handover_frame = ttk.LabelFrame(right_frame, text="接手记录", padding=4)
+        handover_frame.pack(fill="both", expand=True)
+
+        ho_cols = ("time", "from", "to", "reason")
+        self.handover_tree = ttk.Treeview(handover_frame, columns=ho_cols, show="headings", height=4)
+        ho_config = [("time", "时间", 140), ("from", "交出人", 80),
+                     ("to", "接手人", 80), ("reason", "原因", 200)]
+        for cid, cname, cw in ho_config:
+            self.handover_tree.heading(cid, text=cname, anchor="center")
+            self.handover_tree.column(cid, width=cw, minwidth=40, anchor="w")
+
+        ho_vsb = ttk.Scrollbar(handover_frame, orient="vertical", command=self.handover_tree.yview)
+        self.handover_tree.configure(yscrollcommand=ho_vsb.set)
+        self.handover_tree.pack(side="left", fill="both", expand=True)
+        ho_vsb.pack(side="right", fill="y")
+
+    def _build_status_bar(self):
+        self.status_bar = ttk.Label(self, text="", relief="sunken", anchor="w", padding=(8, 2))
+        self.status_bar.pack(fill="x", side="bottom")
+
+    def _refresh_batches(self):
+        self.batch_tree.delete(*self.batch_tree.get_children())
+        batches = self.service.get_audit_batches(**self._current_batch_filters)
+        for b in batches:
+            vals = [b.get(c, "") for c, _, _ in AUDIT_BATCH_TABLE_COLUMNS]
+            self.batch_tree.insert("", "end", iid=str(b["id"]), values=vals, tags=(b["status"],))
+        self._update_status_bar()
+        handlers = self.service.get_all_audit_handlers()
+        self.filter_handler["values"] = [""] + handlers
+
+    def _refresh_items(self, batch_id):
+        self.item_tree.delete(*self.item_tree.get_children())
+        diff_type_filter = self._current_item_filters.get("diff_type")
+        items = self.service.get_audit_items_by_batch(batch_id)
+        if diff_type_filter:
+            items = [it for it in items if it["diff_type"] == diff_type_filter]
+        for it in items:
+            vals = [it.get(c, "") for c, _, _ in AUDIT_ITEM_TABLE_COLUMNS]
+            tags = (it["diff_type"], it["resolution_status"])
+            self.item_tree.insert("", "end", iid=str(it["id"]), values=vals, tags=tags)
+        self._update_status_bar()
+
+    def _refresh_history(self, batch_id):
+        self.hist_tree.delete(*self.hist_tree.get_children())
+        records = self.service.get_audit_history(batch_id)
+        for r in records:
+            change = f"{r['from_status']} → {r['to_status']}" if r['from_status'] else f"→ {r['to_status']}"
+            self.hist_tree.insert("", "end", values=(
+                r["created_at"], r["action"], change, r["operator"], r["remark"]
+            ))
+
+    def _refresh_handover(self, batch_id):
+        self.handover_tree.delete(*self.handover_tree.get_children())
+        records = self.service.get_audit_handover_log(batch_id)
+        for r in records:
+            self.handover_tree.insert("", "end", values=(
+                r["created_at"], r["from_handler"], r["to_handler"], r["reason"]
+            ))
+
+    def _update_status_bar(self):
+        batches = self.service.get_audit_batches(**self._current_batch_filters)
+        total = len(batches)
+        in_progress = sum(1 for b in batches if b["status"] == AUDIT_BATCH_STATUS_IN_PROGRESS)
+        completed = sum(1 for b in batches if b["status"] == AUDIT_BATCH_STATUS_COMPLETED)
+        closed = sum(1 for b in batches if b["status"] == AUDIT_BATCH_STATUS_CLOSED)
+        self.status_bar.config(
+            text=f"共 {total} 个批次 | 进行中: {in_progress} | 已完成: {completed} | 已关闭: {closed}"
+        )
+
+    def _get_operator(self):
+        op = self.operator_var.get().strip()
+        if not op:
+            messagebox.showwarning("提示", "请先在顶部填写当前操作人")
+            return None
+        self._current_operator = op
+        return op
+
+    def _on_filter(self):
+        status = self.filter_batch_status.get().strip() or None
+        handler = self.filter_handler.get().strip() or None
+        date_start = self.filter_date_start.get().strip() or None
+        date_end = self.filter_date_end.get().strip() or None
+        diff_type = self.filter_diff_type.get().strip() or None
+
+        if date_start:
+            try:
+                date.fromisoformat(date_start)
+            except ValueError:
+                messagebox.showerror("错误", "创建起始日期格式应为 YYYY-MM-DD")
+                return
+        if date_end:
+            try:
+                date.fromisoformat(date_end)
+            except ValueError:
+                messagebox.showerror("错误", "创建结束日期格式应为 YYYY-MM-DD")
+                return
+
+        self._current_batch_filters = {
+            "status": status,
+            "handler": handler,
+            "date_start": date_start,
+            "date_end": date_end,
+        }
+        self._current_item_filters = {
+            "diff_type": diff_type,
+        }
+        self._refresh_batches()
+        if self._selected_batch_id:
+            self._refresh_items(self._selected_batch_id)
+
+    def _on_reset_filter(self):
+        self._current_batch_filters = {}
+        self._current_item_filters = {}
+        self.filter_batch_status.set("")
+        self.filter_handler.set("")
+        self.filter_date_start.delete(0, "end")
+        self.filter_date_end.delete(0, "end")
+        self.filter_diff_type.set("")
+        self._refresh_batches()
+
+    def _on_batch_select(self, event=None):
+        sel = self.batch_tree.selection()
+        if not sel:
+            self._selected_batch_id = None
+            self.item_tree.delete(*self.item_tree.get_children())
+            self.hist_tree.delete(*self.hist_tree.get_children())
+            self.handover_tree.delete(*self.handover_tree.get_children())
+            return
+        batch_id = int(sel[0])
+        self._selected_batch_id = batch_id
+        self._refresh_items(batch_id)
+        self._refresh_history(batch_id)
+        self._refresh_handover(batch_id)
+
+    def _on_item_select(self, event=None):
+        sel = self.item_tree.selection()
+        if not sel:
+            self._selected_item_id = None
+            return
+        self._selected_item_id = int(sel[0])
+
+    def _on_create_batch(self):
+        fields = [
+            ("category", "分类依据", "库位"),
+            ("category_value", "分类值", ""),
+            ("creator", "创建人", ""),
+            ("location_filter", "库位筛选(可选)", ""),
+            ("model_filter", "型号筛选(可选)", ""),
+            ("status_filter", "状态筛选(可选)", ""),
+        ]
+        dlg = FormDialog(self, "创建盘点批次", fields, width=400)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r.get("creator"):
+            messagebox.showerror("错误", "创建人不能为空")
+            return
+        if not r.get("category"):
+            messagebox.showerror("错误", "分类依据不能为空")
+            return
+        try:
+            result = self.service.create_audit_batch(
+                r["category"], r["category_value"], r["creator"],
+                location_filter=r.get("location_filter") or None,
+                model_filter=r.get("model_filter") or None,
+                status_filter=r.get("status_filter") or None,
+            )
+            self._refresh_batches()
+            msg = f"盘点批次创建成功！\n批次号: {result['batch_no']}\n共 {result['total_items']} 项"
+            messagebox.showinfo("创建成功", msg)
+        except ValueError as e:
+            messagebox.showerror("创建失败", str(e))
+
+    def _on_delete_batch(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        if not messagebox.askyesno("确认删除", "确定要删除该盘点批次及其所有差异条目吗？"):
+            return
+        try:
+            self.service.delete_audit_batch(self._selected_batch_id, operator)
+            self._selected_batch_id = None
+            self._selected_item_id = None
+            self._refresh_batches()
+            self.item_tree.delete(*self.item_tree.get_children())
+            self.hist_tree.delete(*self.hist_tree.get_children())
+            self.handover_tree.delete(*self.handover_tree.get_children())
+            messagebox.showinfo("成功", "批次已删除")
+        except ValueError as e:
+            messagebox.showerror("删除失败", str(e))
+
+    def _on_import_actual(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="选择实盘清单文件",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            result = self.service.import_actual_count_csv(self._selected_batch_id, filepath, operator)
+            self._refresh_items(self._selected_batch_id)
+            self._refresh_history(self._selected_batch_id)
+            self._refresh_batches()
+            msg = (f"实盘数据导入完成！\n"
+                   f"更新: {result['updated']} 条\n"
+                   f"差异: {result['diff_count']} 条\n"
+                   f"未匹配: {result['not_found']} 条")
+            messagebox.showinfo("导入成功", msg)
+        except ValueError as e:
+            messagebox.showerror("导入失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
+
+    def _on_export(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        items = self.service.get_audit_items_by_batch(self._selected_batch_id)
+        if not items:
+            messagebox.showwarning("提示", "该批次没有差异条目可导出")
+            return
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择导出目录")
+        if not directory:
+            return
+        batch = self.service.get_audit_batch(self._selected_batch_id)
+        filename = f"盘点差异_{batch['batch_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_audit_items_csv(items, directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"差异结果已导出到:\n{path}\n共 {len(items)} 条记录")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_export_template(self):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择模板导出目录")
+        if not directory:
+            return
+        filename = "实盘清单导入模板.csv"
+        try:
+            path = self.service.export_audit_template(directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("成功", f"模板已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_confirm_item(self):
+        if not self._selected_item_id:
+            messagebox.showwarning("提示", "请先选择一条差异条目")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        item = self.service.db.get_audit_item(self._selected_item_id)
+        if not item:
+            return
+        fields = [
+            ("resolution_opinion", "处理意见", ""),
+            ("remark", "备注", item.get("remark", "")),
+        ]
+        dlg = FormDialog(self, "确认处理差异", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        try:
+            self.service.confirm_audit_item(self._selected_item_id, operator,
+                                            r.get("resolution_opinion", ""), r.get("remark", ""))
+            self._refresh_items(item["batch_id"])
+            self._refresh_history(item["batch_id"])
+            self._refresh_batches()
+            messagebox.showinfo("成功", "已确认处理")
+        except ValueError as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_withdraw_item(self):
+        if not self._selected_item_id:
+            messagebox.showwarning("提示", "请先选择一条差异条目")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        item = self.service.db.get_audit_item(self._selected_item_id)
+        if not item:
+            return
+        fields = [
+            ("reason", "撤回原因", ""),
+        ]
+        dlg = FormDialog(self, "撤回确认", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not messagebox.askyesno("确认撤回", "确定要撤回该条目的确认处理吗？"):
+            return
+        try:
+            self.service.withdraw_audit_confirmation(self._selected_item_id, operator, r.get("reason", ""))
+            self._refresh_items(item["batch_id"])
+            self._refresh_history(item["batch_id"])
+            self._refresh_batches()
+            messagebox.showinfo("成功", "已撤回确认")
+        except ValueError as e:
+            messagebox.showerror("撤回失败", str(e))
+
+    def _on_handover(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        fields = [
+            ("to_handler", "接手人", ""),
+            ("reason", "接手原因", ""),
+        ]
+        dlg = FormDialog(self, "接手交接", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r.get("to_handler"):
+            messagebox.showerror("错误", "接手人不能为空")
+            return
+        if not r.get("reason"):
+            messagebox.showerror("错误", "接手原因不能为空")
+            return
+        try:
+            self.service.handover_audit_batch(self._selected_batch_id, operator, r["to_handler"], r["reason"])
+            self._refresh_batches()
+            self._refresh_history(self._selected_batch_id)
+            self._refresh_handover(self._selected_batch_id)
+            messagebox.showinfo("成功", f"已交接给 {r['to_handler']}")
+        except ValueError as e:
+            messagebox.showerror("交接失败", str(e))
+
+    def _on_complete_batch(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        fields = [
+            ("reason", "完成备注", ""),
+        ]
+        dlg = FormDialog(self, "标记完成", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        try:
+            self.service.complete_audit_batch(self._selected_batch_id, operator, r.get("reason", ""))
+            self._refresh_batches()
+            self._refresh_history(self._selected_batch_id)
+            messagebox.showinfo("成功", "批次已标记为完成")
+        except ValueError as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_reopen_batch(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        fields = [
+            ("reason", "重新开启原因", ""),
+        ]
+        dlg = FormDialog(self, "重新开启", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        try:
+            self.service.reopen_audit_batch(self._selected_batch_id, operator, r.get("reason", ""))
+            self._refresh_batches()
+            self._refresh_history(self._selected_batch_id)
+            messagebox.showinfo("成功", "批次已重新开启")
+        except ValueError as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_close_batch(self):
+        if not self._selected_batch_id:
+            messagebox.showwarning("提示", "请先选择一个盘点批次")
+            return
+        operator = self._get_operator()
+        if not operator:
+            return
+        if not messagebox.askyesno("确认关闭", "确定要关闭该盘点批次吗？关闭后不可恢复。"):
+            return
+        fields = [
+            ("reason", "关闭原因", ""),
+        ]
+        dlg = FormDialog(self, "关闭批次", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        try:
+            self.service.close_audit_batch(self._selected_batch_id, operator, r.get("reason", ""))
+            self._refresh_batches()
+            self._refresh_history(self._selected_batch_id)
+            messagebox.showinfo("成功", "批次已关闭")
+        except ValueError as e:
+            messagebox.showerror("关闭失败", str(e))
+
+
 class Application(tk.Tk):
     def __init__(self, service):
         super().__init__()
@@ -4383,6 +5665,10 @@ class Application(tk.Tk):
         inspection_menu = tk.Menu(menubar, tearoff=0)
         inspection_menu.add_command(label="巡检计划台账...", command=self._on_inspection_plans)
         menubar.add_cascade(label="巡检", menu=inspection_menu)
+
+        audit_menu = tk.Menu(menubar, tearoff=0)
+        audit_menu.add_command(label="盘点差异工单...", command=self._on_inventory_audit)
+        menubar.add_cascade(label="盘点", menu=audit_menu)
 
         self.config(menu=menubar)
 
@@ -5052,6 +6338,11 @@ class Application(tk.Tk):
 
     def _on_inspection_plans(self):
         dlg = InspectionPlanDialog(self, self.service)
+        self.wait_window(dlg)
+        self._refresh_table()
+
+    def _on_inventory_audit(self):
+        dlg = InventoryAuditDialog(self, self.service)
         self.wait_window(dlg)
         self._refresh_table()
 

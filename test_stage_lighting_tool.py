@@ -24,6 +24,11 @@ from stage_lighting_tool import (
     INSPECTION_PLAN_RESULT_PASS, INSPECTION_PLAN_RESULT_FAIL,
     INSPECTION_PLAN_EXPORT_HEADERS,
     InspectionPlanDialog,
+    AUDIT_BATCH_STATUS_IN_PROGRESS, AUDIT_BATCH_STATUS_COMPLETED, AUDIT_BATCH_STATUS_CLOSED,
+    AUDIT_DIFF_TYPE_NORMAL, AUDIT_DIFF_TYPE_MISSING, AUDIT_DIFF_TYPE_SERIAL_MISMATCH, AUDIT_DIFF_TYPE_STATUS_ABNORMAL,
+    AUDIT_RESOLUTION_STATUS_PENDING, AUDIT_RESOLUTION_STATUS_CONFIRMED, AUDIT_RESOLUTION_STATUS_WITHDRAWN,
+    AUDIT_ITEM_EXPORT_HEADERS,
+    InventoryAuditDialog,
 )
 
 TMP_DIR = None
@@ -3408,6 +3413,472 @@ def test_gui_inspection_plan_dialog_opens():
     print("  PASS test_gui_inspection_plan_dialog_opens")
 
 
+def test_audit_create_batch():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+    svc.add_fixture("L002", "LED200", "", "A-2", "2027-01-01", "李四")
+
+    result = svc.create_audit_batch("库位", "A区", "张三", location_filter="A-1")
+    assert result["total_items"] == 1
+    assert result["batch_no"].startswith("PD")
+
+    batch = svc.get_audit_batch(result["batch_id"])
+    assert batch["status"] == AUDIT_BATCH_STATUS_IN_PROGRESS
+    assert batch["current_handler"] == "张三"
+
+    items = svc.get_audit_items_by_batch(result["batch_id"])
+    assert len(items) == 1
+    assert items[0]["fixture_no"] == "L001"
+    assert items[0]["diff_type"] == AUDIT_DIFF_TYPE_NORMAL
+
+    db.close()
+    print("  PASS test_audit_create_batch")
+
+
+def test_audit_create_batch_all_fixtures():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+    svc.add_fixture("L002", "LED200", "", "A-2", "2027-01-01", "李四")
+
+    result = svc.create_audit_batch("设备分类", "全部", "王五")
+    assert result["total_items"] == 2
+
+    db.close()
+    print("  PASS test_audit_create_batch_all_fixtures")
+
+
+def test_audit_import_actual_count_csv():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+    svc.add_fixture("L002", "LED200", "", "A-2", "2027-01-01", "李四")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_count.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "PAR64", "可用", "A-1", ""])
+        writer.writerow(["L002", "LED200-WRONG", "借出", "B-1", "型号不对"])
+
+    import_result = svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+    assert import_result["updated"] == 2
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    l001 = [it for it in items if it["fixture_no"] == "L001"][0]
+    assert l001["diff_type"] == AUDIT_DIFF_TYPE_NORMAL
+
+    l002 = [it for it in items if it["fixture_no"] == "L002"][0]
+    assert l002["diff_type"] == AUDIT_DIFF_TYPE_SERIAL_MISMATCH
+    assert l002["actual_model"] == "LED200-WRONG"
+    assert l002["actual_location"] == "B-1"
+
+    db.close()
+    print("  PASS test_audit_import_actual_count_csv")
+
+
+def test_audit_duplicate_import_blocked():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_dup.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "PAR64", "可用", "A-1", ""])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    try:
+        svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+        assert False, "Should have raised ValueError for duplicate import"
+    except ValueError as e:
+        assert "重复导入" in str(e)
+
+    batch = svc.get_audit_batch(batch_id)
+    assert "拦截" in batch["import_log"]
+
+    db.close()
+    print("  PASS test_audit_duplicate_import_blocked")
+
+
+def test_audit_confirm_and_withdraw():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_confirm.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "WRONG", "可用", "A-1", "型号不匹配"])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    diff_item = [it for it in items if it["diff_type"] != AUDIT_DIFF_TYPE_NORMAL][0]
+
+    svc.confirm_audit_item(diff_item["id"], "张三", "报修处理", "待修")
+
+    item = svc.db.get_audit_item(diff_item["id"])
+    assert item["resolution_status"] == AUDIT_RESOLUTION_STATUS_CONFIRMED
+    assert item["handler"] == "张三"
+    assert item["resolution_opinion"] == "报修处理"
+
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["resolved_count"] == 1
+
+    svc.withdraw_audit_confirmation(diff_item["id"], "张三", "误操作")
+
+    item = svc.db.get_audit_item(diff_item["id"])
+    assert item["resolution_status"] == AUDIT_RESOLUTION_STATUS_WITHDRAWN
+
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["resolved_count"] == 0
+
+    db.close()
+    print("  PASS test_audit_confirm_and_withdraw")
+
+
+def test_audit_permission_check():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_perm.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "WRONG", "可用", "A-1", ""])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    diff_item = [it for it in items if it["diff_type"] != AUDIT_DIFF_TYPE_NORMAL][0]
+
+    try:
+        svc.confirm_audit_item(diff_item["id"], "路人甲", "擅自操作")
+        assert False, "Should have raised ValueError for permission"
+    except ValueError as e:
+        assert "创建人" in str(e) or "处理人" in str(e)
+
+    db.close()
+    print("  PASS test_audit_permission_check")
+
+
+def test_audit_handover():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    svc.handover_audit_batch(batch_id, "张三", "李四", "李四更熟悉A区")
+
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["current_handler"] == "李四"
+
+    handover_log = svc.get_audit_handover_log(batch_id)
+    assert len(handover_log) == 1
+    assert handover_log[0]["from_handler"] == "张三"
+    assert handover_log[0]["to_handler"] == "李四"
+    assert handover_log[0]["reason"] == "李四更熟悉A区"
+
+    db.close()
+    print("  PASS test_audit_handover")
+
+
+def test_audit_handover_requires_reason():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    try:
+        svc.handover_audit_batch(batch_id, "张三", "李四", "")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "接手原因" in str(e)
+
+    db.close()
+    print("  PASS test_audit_handover_requires_reason")
+
+
+def test_audit_batch_lifecycle():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    svc.complete_audit_batch(batch_id, "张三", "盘点完毕")
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["status"] == AUDIT_BATCH_STATUS_COMPLETED
+
+    svc.reopen_audit_batch(batch_id, "张三", "还有遗漏")
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["status"] == AUDIT_BATCH_STATUS_IN_PROGRESS
+
+    svc.close_audit_batch(batch_id, "张三", "最终关闭")
+    batch = svc.get_audit_batch(batch_id)
+    assert batch["status"] == AUDIT_BATCH_STATUS_CLOSED
+
+    db.close()
+    print("  PASS test_audit_batch_lifecycle")
+
+
+def test_audit_filter_batches():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+    svc.add_fixture("L002", "LED200", "", "B-1", "2027-01-01", "李四")
+
+    r1 = svc.create_audit_batch("库位", "A区", "张三", location_filter="A-1")
+    r2 = svc.create_audit_batch("库位", "B区", "李四", location_filter="B-1")
+
+    svc.complete_audit_batch(r1["batch_id"], "张三")
+
+    in_progress = svc.get_audit_batches(status=AUDIT_BATCH_STATUS_IN_PROGRESS)
+    assert len(in_progress) == 1
+    assert in_progress[0]["id"] == r2["batch_id"]
+
+    completed = svc.get_audit_batches(status=AUDIT_BATCH_STATUS_COMPLETED)
+    assert len(completed) == 1
+
+    by_handler = svc.get_audit_batches(handler="李四")
+    assert len(by_handler) == 1
+
+    db.close()
+    print("  PASS test_audit_filter_batches")
+
+
+def test_audit_persistence_cross_restart():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_persist.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "WRONG", "可用", "A-1", ""])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items_before = svc.get_audit_items_by_batch(batch_id)
+    diff_before = [it for it in items_before if it["diff_type"] != AUDIT_DIFF_TYPE_NORMAL]
+    assert len(diff_before) == 1
+
+    svc.confirm_audit_item(diff_before[0]["id"], "张三", "已处理")
+
+    db_path = db.db_path
+    db.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    batch2 = svc2.get_audit_batch(batch_id)
+    assert batch2["status"] == AUDIT_BATCH_STATUS_IN_PROGRESS
+    assert batch2["diff_count"] == 1
+    assert batch2["resolved_count"] == 1
+
+    items2 = svc2.get_audit_items_by_batch(batch_id)
+    confirmed = [it for it in items2 if it["resolution_status"] == AUDIT_RESOLUTION_STATUS_CONFIRMED]
+    assert len(confirmed) == 1
+
+    db2.close()
+    print("  PASS test_audit_persistence_cross_restart")
+
+
+def test_audit_export_csv():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_export.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "WRONG", "可用", "A-1", ""])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    export_path = Path(TMP_DIR) / "audit_export.csv"
+    svc.export_audit_items_csv(items, str(TMP_DIR), "audit_export.csv")
+
+    with open(export_path, "r", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        headers = next(reader)
+        assert headers == AUDIT_ITEM_EXPORT_HEADERS
+        rows = list(reader)
+        assert len(rows) == 1
+
+    db.close()
+    print("  PASS test_audit_export_csv")
+
+
+def test_audit_missing_item_diff_type():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_missing.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "", "", "", "找不到"])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    assert items[0]["diff_type"] == AUDIT_DIFF_TYPE_MISSING
+
+    db.close()
+    print("  PASS test_audit_missing_item_diff_type")
+
+
+def test_audit_status_abnormal_diff():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_status.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "PAR64", "借出", "A-1", "状态不一致"])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    items = svc.get_audit_items_by_batch(batch_id)
+    assert items[0]["diff_type"] == AUDIT_DIFF_TYPE_STATUS_ABNORMAL
+
+    db.close()
+    print("  PASS test_audit_status_abnormal_diff")
+
+
+def test_existing_lending_not_broken_by_audit():
+    svc, db = make_service()
+    fid = svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    svc.borrow(fid, "王五", "演出借用")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_BORROWED
+
+    result = svc.create_audit_batch("库位", "A区", "张三")
+    batch_id = result["batch_id"]
+
+    csv_path = Path(TMP_DIR) / "actual_lending.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["灯具编号", "实盘型号", "实盘状态", "实盘库位", "备注"])
+        writer.writerow(["L001", "PAR64", "可用", "A-1", ""])
+
+    svc.import_actual_count_csv(batch_id, str(csv_path), "张三")
+
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_BORROWED, "Audit import should not change fixture status"
+
+    svc.return_fixture(fid, "王五", "归还")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_RETURN_PENDING
+
+    db.close()
+    print("  PASS test_existing_lending_not_broken_by_audit")
+
+
+def test_audit_invalid_inputs():
+    svc, db = make_service()
+    svc.add_fixture("L001", "PAR64", "", "A-1", "2027-01-01", "张三")
+
+    try:
+        svc.create_audit_batch("库位", "A区", "")
+        assert False, "Should have raised ValueError for empty creator"
+    except ValueError as e:
+        assert "创建人" in str(e)
+
+    try:
+        svc.create_audit_batch("", "A区", "张三")
+        assert False, "Should have raised ValueError for empty category"
+    except ValueError as e:
+        assert "分类依据" in str(e)
+
+    try:
+        svc.create_audit_batch("无效分类", "A区", "张三")
+        assert False, "Should have raised ValueError for invalid category"
+    except ValueError as e:
+        assert "分类依据" in str(e)
+
+    try:
+        svc.confirm_audit_item(99999, "张三", "test")
+        assert False, "Should have raised ValueError for non-existent item"
+    except ValueError as e:
+        assert "不存在" in str(e)
+
+    try:
+        svc.handover_audit_batch(99999, "张三", "李四", "原因")
+        assert False, "Should have raised ValueError for non-existent batch"
+    except ValueError as e:
+        assert "不存在" in str(e)
+
+    db.close()
+    print("  PASS test_audit_invalid_inputs")
+
+
+def test_gui_inventory_audit_dialog_opens():
+    import tkinter as tk
+    from tkinter import ttk
+
+    svc, db = make_service()
+    svc.add_fixture("GUI001", "GUIModel", "", "G-01", "2027-12-31", "GUI测试员")
+
+    result = svc.create_audit_batch("库位", "G区", "GUI测试员")
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        dlg = InventoryAuditDialog(root, svc)
+        dlg.update()
+
+        assert dlg.title() == "盘点差异工单"
+
+        tree_children = dlg.batch_tree.get_children()
+        assert len(tree_children) > 0
+
+        first_item = dlg.batch_tree.item(tree_children[0])
+        assert "PD" in str(first_item["values"][1])
+
+        dlg.filter_batch_status.set(AUDIT_BATCH_STATUS_IN_PROGRESS)
+        dlg._on_filter()
+        dlg.update()
+
+        dlg.destroy()
+        root.update()
+    finally:
+        root.destroy()
+        db.close()
+
+    print("  PASS test_gui_inventory_audit_dialog_opens")
+
+
 def main():
     setup()
     tests = [
@@ -3504,6 +3975,23 @@ def main():
         test_existing_lending_not_broken_by_inspection_plan,
         test_inspection_plan_invalid_inputs,
         test_gui_inspection_plan_dialog_opens,
+        test_audit_create_batch,
+        test_audit_create_batch_all_fixtures,
+        test_audit_import_actual_count_csv,
+        test_audit_duplicate_import_blocked,
+        test_audit_confirm_and_withdraw,
+        test_audit_permission_check,
+        test_audit_handover,
+        test_audit_handover_requires_reason,
+        test_audit_batch_lifecycle,
+        test_audit_filter_batches,
+        test_audit_persistence_cross_restart,
+        test_audit_export_csv,
+        test_audit_missing_item_diff_type,
+        test_audit_status_abnormal_diff,
+        test_existing_lending_not_broken_by_audit,
+        test_audit_invalid_inputs,
+        test_gui_inventory_audit_dialog_opens,
     ]
     passed = 0
     failed = 0

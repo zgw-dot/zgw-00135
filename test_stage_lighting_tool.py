@@ -18,6 +18,8 @@ from stage_lighting_tool import (
     STATUS_INSPECTION_FREEZE, STATUS_MAINTENANCE_FREEZE, STATUS_SCRAPPED,
     SETTING_FILTER_LOCATION, SETTING_FILTER_STATUS, SETTING_FILTER_DUE_START, SETTING_FILTER_DUE_END,
     RESULT_NEW, RESULT_UPDATE, RESULT_SKIP, RESULT_ERROR, EXPORT_HEADERS,
+    CONFLICT_STATUS_PENDING, CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED,
+    RESOLUTION_ACTION_ORIGINAL, RESOLUTION_ACTION_REFRESH, RESOLUTION_ACTION_DISCARD,
 )
 
 TMP_DIR = None
@@ -2414,6 +2416,396 @@ def test_draft_export_reopen_consistent():
     print("  PASS test_draft_export_reopen_consistent")
 
 
+def test_draft_conflict_resolution_refresh_discard():
+    """冲突刷新与放弃：单条记录刷新、保持原样、放弃三种操作都正确持久化并生效"""
+    svc, db = make_service()
+
+    svc.add_fixture("RD001", "OldModel", "old_acc", "OldLoc", "2026-01-01", "OldPerson")
+    svc.add_fixture("RD002", "KeepModel", "keep_acc", "KeepLoc", "2026-06-01", "KeepPerson")
+    svc.add_fixture("RD003", "DiscardModel", "", "DLoc", "2026-03-01", "DPerson")
+
+    out_dir = Path(TMP_DIR) / "draft_resolution"
+    out_dir.mkdir()
+    rows = [
+        ["RD001", "NewModel1", "new_acc1", "NewLoc1", "2027-12-01", "NewPerson1", "", ""],
+        ["RD002", "NewModel2", "new_acc2", "NewLoc2", "2027-12-01", "NewPerson2", "", ""],
+        ["RD003", "NewModel3", "", "NewLoc3", "2027-12-01", "NewPerson3", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "冲突处理测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    db.execute("UPDATE fixtures SET status=?, model=?, person_in_charge=? WHERE fixture_no=?",
+               (STATUS_BORROWED, "BorrowedModel", "Borrower", "RD001"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_INSPECTION_FREEZE, "RD002"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_MAINTENANCE_FREEZE, "RD003"))
+    db.commit()
+
+    conflicts = svc.detect_and_persist_conflicts(draft_id, str(filepath))
+    assert len(conflicts) >= 3
+
+    summary_c = svc.get_draft_conflicts_summary(draft_id)
+    assert summary_c["pending"] >= 3
+    assert summary_c["total_conflicts"] >= 3
+
+    items = db.get_draft_items(draft_id)
+    items_by_no = {it["fixture_no"]: it for it in items}
+
+    svc.refresh_draft_item_from_db(items_by_no["RD001"]["id"], "按库内刷新RD001")
+    svc.keep_original_draft_item(items_by_no["RD002"]["id"], "保持RD002草稿原样")
+    svc.discard_draft_item(items_by_no["RD003"]["id"], "放弃RD003")
+
+    items2 = db.get_draft_items(draft_id)
+    items2_by_no = {it["fixture_no"]: it for it in items2}
+
+    rd001 = items2_by_no["RD001"]
+    assert rd001["conflict_status"] == CONFLICT_STATUS_RESOLVED
+    assert rd001["resolution_action"] == RESOLUTION_ACTION_REFRESH
+    assert rd001["resolution_note"] == "按库内刷新RD001"
+    assert rd001["selected"] == 1
+    after_obj = json.loads(rd001["after_snapshot"])
+    assert after_obj["status"] == STATUS_BORROWED
+    assert after_obj["model"] == "BorrowedModel"
+    assert after_obj["person_in_charge"] == "Borrower"
+
+    rd002 = items2_by_no["RD002"]
+    assert rd002["conflict_status"] == CONFLICT_STATUS_RESOLVED
+    assert rd002["resolution_action"] == RESOLUTION_ACTION_ORIGINAL
+    assert rd002["resolution_note"] == "保持RD002草稿原样"
+    assert rd002["selected"] == 1
+
+    rd003 = items2_by_no["RD003"]
+    assert rd003["conflict_status"] == CONFLICT_STATUS_DISCARDED
+    assert rd003["resolution_action"] == RESOLUTION_ACTION_DISCARD
+    assert rd003["resolution_note"] == "放弃RD003"
+    assert rd003["selected"] == 0
+
+    summary_c2 = svc.get_draft_conflicts_summary(draft_id)
+    assert summary_c2["pending"] == 0
+    assert summary_c2["resolved"] == 2
+    assert summary_c2["discarded"] == 1
+
+    db.close()
+    print("  PASS test_draft_conflict_resolution_refresh_discard")
+
+
+def test_draft_conflict_persistence_cross_restart():
+    """跨重启续做：冲突处理进度、勾选状态、备注关闭再打开都能恢复"""
+    db_path = Path(TMP_DIR) / "draft_conflict_persist.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    svc1.add_fixture("XP001", "Old1", "", "L1", "2026-01-01", "P1")
+    svc1.add_fixture("XP002", "Old2", "", "L2", "2026-01-01", "P2")
+    svc1.add_fixture("XP003", "Old3", "", "L3", "2026-01-01", "P3")
+    svc1.add_fixture("XP004", "Old4", "", "L4", "2026-01-01", "P4")
+
+    out_dir = Path(TMP_DIR) / "draft_cross_restart_resolution"
+    out_dir.mkdir()
+    rows = [
+        ["XP001", "New1", "", "NL1", "2027-12-01", "NP1", "", ""],
+        ["XP002", "New2", "", "NL2", "2027-12-01", "NP2", "", ""],
+        ["XP003", "New3", "", "NL3", "2027-12-01", "NP3", "", ""],
+        ["XP004", "New4", "", "NL4", "2027-12-01", "NP4", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc1.parse_import_file(str(filepath))
+    precheck_results, summary = svc1.precheck_import(records)
+    create_result = svc1.create_draft_from_precheck(
+        str(filepath), "重启前测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+    draft_no = create_result["draft_no"]
+
+    db1.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "XP001"))
+    db1.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "XP002"))
+    db1.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "XP003"))
+    db1.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "XP004"))
+    db1.commit()
+
+    svc1.detect_and_persist_conflicts(draft_id, str(filepath))
+    items1 = db1.get_draft_items(draft_id)
+    items1_by_no = {it["fixture_no"]: it for it in items1}
+
+    svc1.refresh_draft_item_from_db(items1_by_no["XP001"]["id"], "刷新备注-XP001")
+    svc1.keep_original_draft_item(items1_by_no["XP002"]["id"], "原样备注-XP002")
+    svc1.discard_draft_item(items1_by_no["XP003"]["id"], "放弃备注-XP003")
+
+    svc1.set_item_resolution_note(items1_by_no["XP004"]["id"], "XP004待稍后处理")
+
+    svc1.db.set_draft_item_selected(items1_by_no["XP002"]["id"], False)
+
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    drafts = svc2.get_draft_batches()
+    assert len(drafts) == 1
+    assert drafts[0]["draft_no"] == draft_no
+
+    svc2.detect_and_persist_conflicts(draft_id, str(filepath))
+
+    summary_c = svc2.get_draft_conflicts_summary(draft_id)
+    assert summary_c["resolved"] == 2
+    assert summary_c["discarded"] == 1
+    assert summary_c["pending"] == 1
+
+    items2 = db2.get_draft_items(draft_id)
+    items2_by_no = {it["fixture_no"]: it for it in items2}
+
+    xp001 = items2_by_no["XP001"]
+    assert xp001["conflict_status"] == CONFLICT_STATUS_RESOLVED
+    assert xp001["resolution_action"] == RESOLUTION_ACTION_REFRESH
+    assert xp001["resolution_note"] == "刷新备注-XP001"
+    assert xp001["selected"] == 1
+
+    xp002 = items2_by_no["XP002"]
+    assert xp002["conflict_status"] == CONFLICT_STATUS_RESOLVED
+    assert xp002["resolution_action"] == RESOLUTION_ACTION_ORIGINAL
+    assert xp002["resolution_note"] == "原样备注-XP002"
+    assert xp002["selected"] == 0
+
+    xp003 = items2_by_no["XP003"]
+    assert xp003["conflict_status"] == CONFLICT_STATUS_DISCARDED
+    assert xp003["resolution_action"] == RESOLUTION_ACTION_DISCARD
+    assert xp003["resolution_note"] == "放弃备注-XP003"
+    assert xp003["selected"] == 0
+
+    xp004 = items2_by_no["XP004"]
+    assert xp004["conflict_status"] == CONFLICT_STATUS_PENDING
+    assert xp004["resolution_note"] == "XP004待稍后处理"
+
+    db2.close()
+    print("  PASS test_draft_conflict_persistence_cross_restart")
+
+
+def test_draft_conflict_partial_submit():
+    """部分提交：刷新后+原样+放弃混合提交，校验统计、数据写入和未处理冲突拦截"""
+    svc, db = make_service()
+
+    svc.add_fixture("PS001", "OldRefresh", "", "R-Loc", "2026-01-01", "R-Person")
+    svc.add_fixture("PS002", "OldOriginal", "", "O-Loc", "2026-01-01", "O-Person")
+    svc.add_fixture("PS003", "OldDiscard", "", "D-Loc", "2026-01-01", "D-Person")
+
+    out_dir = Path(TMP_DIR) / "draft_partial_submit"
+    out_dir.mkdir()
+    rows = [
+        ["PS001", "DraftRefresh", "r-acc", "R-New", "2027-12-01", "R-New", "", ""],
+        ["PS002", "DraftOriginal", "o-acc", "O-New", "2027-12-01", "O-New", "", ""],
+        ["PS003", "DraftDiscard", "", "D-New", "2027-12-01", "D-New", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "部分提交测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    db.execute("UPDATE fixtures SET status=?, model=?, person_in_charge=? WHERE fixture_no=?",
+               (STATUS_BORROWED, "DBRefreshModel", "DBRefreshPerson", "PS001"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_INSPECTION_FREEZE, "PS002"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_MAINTENANCE_FREEZE, "PS003"))
+    db.commit()
+
+    svc.detect_and_persist_conflicts(draft_id, str(filepath))
+    items = db.get_draft_items(draft_id)
+    items_by_no = {it["fixture_no"]: it for it in items}
+
+    svc.refresh_draft_item_from_db(items_by_no["PS001"]["id"], "按库内刷新")
+    svc.keep_original_draft_item(items_by_no["PS002"]["id"], "按草稿原样")
+    svc.discard_draft_item(items_by_no["PS003"]["id"], "放弃不提交")
+
+    result = svc.submit_draft(draft_id, "部分提交操作员", str(filepath))
+    assert result["success"] is True
+    batch_id = result["batch_id"]
+
+    assert result.get("resolution_refresh", 0) == 1
+    assert result.get("resolution_original", 0) == 1
+    assert result.get("resolution_discard", 0) == 1
+
+    ps001 = db.get_fixture_by_no("PS001")
+    assert ps001["model"] == "DBRefreshModel"
+    assert ps001["status"] == STATUS_BORROWED
+    assert ps001["person_in_charge"] == "DBRefreshPerson"
+
+    ps002 = db.get_fixture_by_no("PS002")
+    assert ps002["model"] == "DraftOriginal"
+    assert ps002["location"] == "O-New"
+    assert ps002["person_in_charge"] == "O-New"
+
+    ps003 = db.get_fixture_by_no("PS003")
+    assert ps003["model"] == "OldDiscard"
+    assert ps003["location"] == "D-Loc"
+    assert ps003["person_in_charge"] == "D-Person"
+    assert ps003["status"] == STATUS_MAINTENANCE_FREEZE
+
+    detail = svc.get_import_batch_detail(batch_id)
+    assert len(detail["items"]) == 2
+
+    batch = db.get_import_batch(batch_id)
+    assert "[刷新后提交: 1, 原样提交: 1, 放弃: 1" in batch["error_message"] or "刷新" in batch["error_message"]
+
+    items_by_result = {it["fixture_no"]: it for it in detail["items"]}
+    assert "PS001" in items_by_result
+    assert "PS002" in items_by_result
+    assert "PS003" not in items_by_result
+
+    assert "[刷新后提交]" in items_by_result["PS001"]["error_message"]
+    assert "[原样提交]" in items_by_result["PS002"]["error_message"]
+
+    db.close()
+    print("  PASS test_draft_conflict_partial_submit")
+
+
+def test_draft_conflict_unresolved_blocks_submit():
+    """未处理冲突拦截：存在pending冲突时提交被阻止，处理完后才能提交"""
+    svc, db = make_service()
+
+    svc.add_fixture("UB001", "Old1", "", "L1", "2026-01-01", "P1")
+    svc.add_fixture("UB002", "Old2", "", "L2", "2026-01-01", "P2")
+
+    out_dir = Path(TMP_DIR) / "draft_unresolved_block"
+    out_dir.mkdir()
+    rows = [
+        ["UB001", "New1", "", "NL1", "2027-12-01", "NP1", "", ""],
+        ["UB002", "New2", "", "NL2", "2027-12-01", "NP2", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "拦截测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "UB001"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_BORROWED, "UB002"))
+    db.commit()
+
+    svc.detect_and_persist_conflicts(draft_id, str(filepath))
+    assert svc.has_unresolved_conflicts(draft_id) is True
+
+    try:
+        svc.submit_draft(draft_id, "提交员", str(filepath))
+        assert False, "有未处理冲突应该被拦截"
+    except ValueError as e:
+        assert "未处理" in str(e) or "冲突" in str(e)
+        assert hasattr(e, "conflicts")
+        assert len(e.conflicts) == 2
+
+    items = db.get_draft_items(draft_id)
+    items_by_no = {it["fixture_no"]: it for it in items}
+    svc.keep_original_draft_item(items_by_no["UB001"]["id"])
+    svc.refresh_draft_item_from_db(items_by_no["UB002"]["id"])
+
+    assert svc.has_unresolved_conflicts(draft_id) is False
+
+    result = svc.submit_draft(draft_id, "提交员", str(filepath))
+    assert result["success"] is True
+
+    db.close()
+    print("  PASS test_draft_conflict_unresolved_blocks_submit")
+
+
+def test_draft_conflict_export_and_log_consistency():
+    """导出和日志一致性：冲突清单导出、最终明细导出、日志分类都正确"""
+    svc, db = make_service()
+
+    svc.add_fixture("EX001", "OldA", "acc-a", "LocA", "2026-01-01", "PerA")
+    svc.add_fixture("EX002", "OldB", "acc-b", "LocB", "2026-01-01", "PerB")
+    svc.add_fixture("EX003", "OldC", "", "LocC", "2026-01-01", "PerC")
+
+    out_dir = Path(TMP_DIR) / "draft_export_log"
+    out_dir.mkdir()
+    rows = [
+        ["EX001", "NewA", "new-a", "NewA", "2027-12-01", "NewPerA", "", ""],
+        ["EX002", "NewB", "new-b", "NewB", "2027-12-01", "NewPerB", "", ""],
+        ["EX003", "NewC", "", "NewC", "2027-12-01", "NewPerC", "", ""],
+    ]
+    filepath = _make_import_csv(out_dir, rows)
+
+    records = svc.parse_import_file(str(filepath))
+    precheck_results, summary = svc.precheck_import(records)
+    create_result = svc.create_draft_from_precheck(
+        str(filepath), "导出测试员", precheck_results, summary
+    )
+    draft_id = create_result["draft_id"]
+
+    db.execute("UPDATE fixtures SET status=?, model=? WHERE fixture_no=?",
+               (STATUS_BORROWED, "DB-Refresh", "EX001"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_INSPECTION_FREEZE, "EX002"))
+    db.execute("UPDATE fixtures SET status=? WHERE fixture_no=?", (STATUS_MAINTENANCE_FREEZE, "EX003"))
+    db.commit()
+
+    svc.detect_and_persist_conflicts(draft_id, str(filepath))
+    items = db.get_draft_items(draft_id)
+    items_by_no = {it["fixture_no"]: it for it in items}
+
+    svc.refresh_draft_item_from_db(items_by_no["EX001"]["id"], "EX001-刷新备注")
+    svc.keep_original_draft_item(items_by_no["EX002"]["id"], "EX002-原样备注")
+    svc.discard_draft_item(items_by_no["EX003"]["id"], "EX003-放弃备注")
+
+    export_dir = out_dir / "exports"
+    export_dir.mkdir()
+
+    conflicts_path = svc.export_draft_conflicts(draft_id, str(export_dir), "conflicts.csv")
+    assert os.path.exists(conflicts_path)
+    with open(conflicts_path, "r", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        assert "冲突类型" in header
+        assert "草稿值-型号" in header
+        assert "库内值-型号" in header
+        assert "处理方式" in header
+        c_rows = list(reader)
+        assert len(c_rows) == 3
+        nos = {r[1] for r in c_rows}
+        assert nos == {"EX001", "EX002", "EX003"}
+
+    result = svc.submit_draft(draft_id, "导出提交员", str(filepath))
+    batch_id = result["batch_id"]
+
+    final_path = svc.export_batch_final_detail(batch_id, str(export_dir), "final_detail.csv")
+    assert os.path.exists(final_path)
+    with open(final_path, "r", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        assert "处理方式" in header
+        f_rows = list(reader)
+        submit_types = {r[1]: r[3] for r in f_rows}
+        assert submit_types.get("EX001") == "刷新后"
+        assert submit_types.get("EX002") == "原样"
+
+    detail = svc.get_import_batch_detail(batch_id)
+    msg_by_no = {it["fixture_no"]: it["error_message"] for it in detail["items"]}
+    assert "[刷新后提交]" in msg_by_no.get("EX001", "")
+    assert "EX001-刷新备注" in msg_by_no.get("EX001", "")
+    assert "[原样提交]" in msg_by_no.get("EX002", "")
+    assert "EX002-原样备注" in msg_by_no.get("EX002", "")
+
+    history_ex001 = db.get_history(db.get_fixture_by_no("EX001")["id"])
+    assert any(h["action"] == "批量更新" for h in history_ex001)
+
+    history_ex002 = db.get_history(db.get_fixture_by_no("EX002")["id"])
+    assert any(h["action"] == "批量更新" for h in history_ex002)
+
+    history_ex003 = db.get_history(db.get_fixture_by_no("EX003")["id"])
+    assert not any(h["action"] == "批量更新" for h in history_ex003)
+
+    db.close()
+    print("  PASS test_draft_conflict_export_and_log_consistency")
+
+
 def main():
     setup()
     tests = [
@@ -2491,6 +2883,11 @@ def main():
         test_draft_reopen_file_missing_conflict,
         test_draft_cross_restart_reopen_file_changed,
         test_draft_export_reopen_consistent,
+        test_draft_conflict_resolution_refresh_discard,
+        test_draft_conflict_persistence_cross_restart,
+        test_draft_conflict_partial_submit,
+        test_draft_conflict_unresolved_blocks_submit,
+        test_draft_conflict_export_and_log_consistency,
     ]
     passed = 0
     failed = 0

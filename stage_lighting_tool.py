@@ -85,6 +85,16 @@ RESULT_UPDATE = "更新"
 RESULT_SKIP = "跳过"
 RESULT_ERROR = "错误"
 
+CONFLICT_STATUS_NONE = ""
+CONFLICT_STATUS_PENDING = "pending"
+CONFLICT_STATUS_RESOLVED = "resolved"
+CONFLICT_STATUS_DISCARDED = "discarded"
+
+RESOLUTION_ACTION_NONE = ""
+RESOLUTION_ACTION_ORIGINAL = "original"
+RESOLUTION_ACTION_REFRESH = "refresh"
+RESOLUTION_ACTION_DISCARD = "discard"
+
 ROLLBACK_SAFE_STATUSES = {STATUS_AVAILABLE}
 
 
@@ -184,6 +194,11 @@ class DatabaseManager:
                 selected INTEGER NOT NULL DEFAULT 1,
                 conflict_type TEXT NOT NULL DEFAULT '',
                 conflict_detail TEXT NOT NULL DEFAULT '',
+                conflict_status TEXT NOT NULL DEFAULT '',
+                resolution_action TEXT NOT NULL DEFAULT '',
+                resolution_note TEXT NOT NULL DEFAULT '',
+                current_db_snapshot TEXT NOT NULL DEFAULT '',
+                resolved_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
             );
@@ -200,6 +215,26 @@ class DatabaseManager:
         """)
         try:
             self.conn.execute("ALTER TABLE import_draft_batches ADD COLUMN source_file_path TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN conflict_status TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN resolution_action TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN resolution_note TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN current_db_snapshot TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN resolved_at TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
         self.conn.commit()
@@ -381,10 +416,10 @@ class DatabaseManager:
         row = self.execute("SELECT * FROM import_draft_batches WHERE draft_no=?", (draft_no,)).fetchone()
         return dict(row) if row else None
 
-    def add_draft_item(self, draft_id, fixture_no, row_index, result, error_message="", before_snapshot="", after_snapshot="", record_data="", selected=1, conflict_type="", conflict_detail=""):
+    def add_draft_item(self, draft_id, fixture_no, row_index, result, error_message="", before_snapshot="", after_snapshot="", record_data="", selected=1, conflict_type="", conflict_detail="", conflict_status="", resolution_action="", resolution_note="", current_db_snapshot="", resolved_at=""):
         cur = self.execute(
-            "INSERT INTO import_draft_items (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, selected, conflict_type, conflict_detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, 1 if selected else 0, conflict_type, conflict_detail),
+            "INSERT INTO import_draft_items (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, selected, conflict_type, conflict_detail, conflict_status, resolution_action, resolution_note, current_db_snapshot, resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (draft_id, fixture_no, row_index, result, error_message, before_snapshot, after_snapshot, record_data, 1 if selected else 0, conflict_type, conflict_detail, conflict_status, resolution_action, resolution_note, current_db_snapshot, resolved_at),
         )
         return cur.lastrowid
 
@@ -424,6 +459,67 @@ class DatabaseManager:
     def count_draft_items_by_result(self, draft_id):
         rows = self.execute("SELECT result, COUNT(*) as cnt, SUM(selected) as sel_cnt FROM import_draft_items WHERE draft_id=? GROUP BY result", (draft_id,)).fetchall()
         return {r["result"]: {"total": r["cnt"], "selected": r["sel_cnt"]} for r in rows}
+
+    def count_draft_items_by_conflict_status(self, draft_id):
+        rows = self.execute("SELECT conflict_status, COUNT(*) as cnt FROM import_draft_items WHERE draft_id=? GROUP BY conflict_status", (draft_id,)).fetchall()
+        return {r["conflict_status"]: r["cnt"] for r in rows}
+
+    def get_draft_items_with_conflicts(self, draft_id):
+        rows = self.execute("SELECT * FROM import_draft_items WHERE draft_id=? AND conflict_status!=? ORDER BY row_index",
+                            (draft_id, CONFLICT_STATUS_NONE)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_draft_items_pending_conflicts(self, draft_id):
+        rows = self.execute("SELECT * FROM import_draft_items WHERE draft_id=? AND conflict_status=? ORDER BY row_index",
+                            (draft_id, CONFLICT_STATUS_PENDING)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_draft_item_conflict(self, item_id, conflict_type, conflict_detail, current_db_snapshot=""):
+        self.execute(
+            "UPDATE import_draft_items SET conflict_type=?, conflict_detail=?, conflict_status=?, current_db_snapshot=?, resolution_action=?, resolution_note=?, resolved_at=? WHERE id=?",
+            (conflict_type, conflict_detail, CONFLICT_STATUS_PENDING, current_db_snapshot, RESOLUTION_ACTION_NONE, "", "", item_id),
+        )
+        self.commit()
+
+    def clear_draft_item_conflict(self, item_id):
+        self.execute(
+            "UPDATE import_draft_items SET conflict_type=?, conflict_detail=?, conflict_status=?, current_db_snapshot=?, resolution_action=?, resolution_note=?, resolved_at=? WHERE id=?",
+            ("", "", CONFLICT_STATUS_NONE, "", RESOLUTION_ACTION_NONE, "", "", item_id),
+        )
+        self.commit()
+
+    def resolve_draft_item(self, item_id, resolution_action, resolution_note="", before_snapshot=None, after_snapshot=None, record_data=None, result=None):
+        updates = {
+            "conflict_status": CONFLICT_STATUS_DISCARDED if resolution_action == RESOLUTION_ACTION_DISCARD else CONFLICT_STATUS_RESOLVED,
+            "resolution_action": resolution_action,
+            "resolution_note": resolution_note,
+            "resolved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if resolution_action == RESOLUTION_ACTION_DISCARD:
+            updates["selected"] = 0
+        if before_snapshot is not None:
+            updates["before_snapshot"] = before_snapshot
+        if after_snapshot is not None:
+            updates["after_snapshot"] = after_snapshot
+        if record_data is not None:
+            updates["record_data"] = record_data
+        if result is not None:
+            updates["result"] = result
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [item_id]
+        self.execute(f"UPDATE import_draft_items SET {sets} WHERE id=?", vals)
+        self.commit()
+
+    def set_draft_item_resolution_note(self, item_id, resolution_note):
+        self.execute("UPDATE import_draft_items SET resolution_note=? WHERE id=?", (resolution_note or "", item_id))
+        self.commit()
+
+    def refresh_all_conflicts_for_draft(self, draft_id):
+        self.execute(
+            "UPDATE import_draft_items SET conflict_type=?, conflict_detail=?, conflict_status=?, current_db_snapshot=?, resolution_action=?, resolution_note=?, resolved_at=? WHERE draft_id=?",
+            ("", "", CONFLICT_STATUS_NONE, "", RESOLUTION_ACTION_NONE, "", "", draft_id),
+        )
+        self.commit()
 
     def begin_transaction(self):
         self.execute("BEGIN IMMEDIATE")
@@ -1192,6 +1288,13 @@ class LightingService:
                 item["record_obj"] = json.loads(item["record_data"])
             else:
                 item["record_obj"] = None
+            if item.get("current_db_snapshot"):
+                try:
+                    item["current_db_obj"] = json.loads(item["current_db_snapshot"])
+                except Exception:
+                    item["current_db_obj"] = None
+            else:
+                item["current_db_obj"] = None
         return {"draft": draft, "items": items}
 
     def update_draft_remark(self, draft_id, remark):
@@ -1252,6 +1355,7 @@ class LightingService:
                         "fixture_no": fixture_no,
                         "item_id": item["id"],
                         "detail": f"灯具已存在（当前状态: {current['status']}），不能再新增",
+                        "current_db": dict(current),
                     })
                     continue
 
@@ -1262,6 +1366,7 @@ class LightingService:
                         "fixture_no": fixture_no,
                         "item_id": item["id"],
                         "detail": "灯具已被删除，无法更新",
+                        "current_db": None,
                     })
                     continue
 
@@ -1279,6 +1384,7 @@ class LightingService:
                             "fixture_no": fixture_no,
                             "item_id": item["id"],
                             "detail": f"灯具数据已变化: {'; '.join(changed_fields)}",
+                            "current_db": dict(current),
                         })
                         continue
 
@@ -1292,9 +1398,110 @@ class LightingService:
                             "fixture_no": fixture_no,
                             "item_id": item["id"],
                             "detail": f"已被批次 {latest_batch['batch_no']}（{batch_created}）修改过",
+                            "current_db": dict(current),
                         })
 
         return conflicts
+
+    def detect_and_persist_conflicts(self, draft_id, filepath=None):
+        all_items = self.db.get_draft_items(draft_id)
+        all_items_by_id = {it["id"]: dict(it) for it in all_items}
+
+        conflicts = self._detect_draft_conflicts(draft_id, filepath)
+        conflict_item_ids = set()
+
+        for c in conflicts:
+            if c.get("item_id"):
+                conflict_item_ids.add(c["item_id"])
+                current_db_snap = json.dumps(c.get("current_db"), ensure_ascii=False) if c.get("current_db") else ""
+                existing = all_items_by_id.get(c["item_id"], {})
+                existing_status = existing.get("conflict_status", "")
+                existing_action = existing.get("resolution_action", "")
+                if existing_status in (CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED) and existing_action:
+                    self.db.execute(
+                        "UPDATE import_draft_items SET conflict_type=?, conflict_detail=?, current_db_snapshot=? WHERE id=?",
+                        (c["type"], c["detail"], current_db_snap, c["item_id"]),
+                    )
+                    self.db.commit()
+                else:
+                    self.db.set_draft_item_conflict(c["item_id"], c["type"], c["detail"], current_db_snap)
+
+        for item_id, item in all_items_by_id.items():
+            if item_id not in conflict_item_ids and item.get("conflict_status"):
+                if item.get("conflict_status") == CONFLICT_STATUS_PENDING:
+                    self.db.clear_draft_item_conflict(item_id)
+                elif item.get("conflict_status") in (CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED):
+                    self.db.clear_draft_item_conflict(item_id)
+
+        return conflicts
+
+    def refresh_draft_item_from_db(self, item_id, operator_note=""):
+        item = self.db.execute("SELECT * FROM import_draft_items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise ValueError("草稿项不存在")
+        fixture_no = item["fixture_no"]
+        current = self.db.get_fixture_by_no(fixture_no)
+
+        record_obj = json.loads(item["record_data"]) if item["record_data"] else {}
+
+        if not current:
+            new_result = RESULT_NEW
+            new_before_snap = ""
+            new_record = dict(record_obj)
+            new_after_snap = json.dumps(new_record, ensure_ascii=False)
+            new_record_data = json.dumps(new_record, ensure_ascii=False)
+        else:
+            new_result = RESULT_UPDATE
+            new_before_snap = json.dumps(dict(current), ensure_ascii=False)
+            new_record = dict(record_obj)
+            for field in ["status", "model", "accessories", "location", "inspection_due_date", "person_in_charge", "last_remark"]:
+                if field in current and current.get(field):
+                    new_record[field] = current[field]
+            new_after_snap = json.dumps(new_record, ensure_ascii=False)
+            new_record_data = json.dumps(new_record, ensure_ascii=False)
+
+        self.db.resolve_draft_item(
+            item_id,
+            resolution_action=RESOLUTION_ACTION_REFRESH,
+            resolution_note=operator_note,
+            before_snapshot=new_before_snap,
+            after_snapshot=new_after_snap,
+            record_data=new_record_data,
+            result=new_result,
+        )
+        return True
+
+    def discard_draft_item(self, item_id, operator_note=""):
+        self.db.resolve_draft_item(
+            item_id,
+            resolution_action=RESOLUTION_ACTION_DISCARD,
+            resolution_note=operator_note,
+        )
+        return True
+
+    def keep_original_draft_item(self, item_id, operator_note=""):
+        self.db.resolve_draft_item(
+            item_id,
+            resolution_action=RESOLUTION_ACTION_ORIGINAL,
+            resolution_note=operator_note,
+        )
+        return True
+
+    def set_item_resolution_note(self, item_id, note):
+        self.db.set_draft_item_resolution_note(item_id, note)
+
+    def get_draft_conflicts_summary(self, draft_id):
+        counts = self.db.count_draft_items_by_conflict_status(draft_id)
+        return {
+            "total_conflicts": counts.get(CONFLICT_STATUS_PENDING, 0) + counts.get(CONFLICT_STATUS_RESOLVED, 0) + counts.get(CONFLICT_STATUS_DISCARDED, 0),
+            "pending": counts.get(CONFLICT_STATUS_PENDING, 0),
+            "resolved": counts.get(CONFLICT_STATUS_RESOLVED, 0),
+            "discarded": counts.get(CONFLICT_STATUS_DISCARDED, 0),
+        }
+
+    def has_unresolved_conflicts(self, draft_id):
+        pending = self.db.get_draft_items_pending_conflicts(draft_id)
+        return len(pending) > 0
 
     def submit_draft(self, draft_id, operator, filepath=None):
         if not operator:
@@ -1306,16 +1513,24 @@ class LightingService:
         if draft["status"] != "draft":
             raise ValueError(f"草稿状态为「{draft['status']}」，无法提交")
 
-        conflicts = self._detect_draft_conflicts(draft_id, filepath)
-        if conflicts:
+        all_conflicts = self.detect_and_persist_conflicts(draft_id, filepath)
+
+        file_level_conflicts = [c for c in all_conflicts if not c.get("item_id")]
+        pending_item_conflicts = self.db.get_draft_items_pending_conflicts(draft_id)
+
+        if file_level_conflicts or pending_item_conflicts:
             conflict_msgs = []
-            for c in conflicts:
-                if c["fixture_no"]:
-                    conflict_msgs.append(f"{c['fixture_no']}: {c['detail']}")
-                else:
-                    conflict_msgs.append(c["detail"])
-            err = ValueError("提交前检测到冲突:\n" + "\n".join(conflict_msgs))
-            err.conflicts = conflicts
+            combined_conflicts = []
+            for fc in file_level_conflicts:
+                conflict_msgs.append(f"[文件级] {fc['detail']}")
+                combined_conflicts.append(fc)
+            for p in pending_item_conflicts:
+                conflict_msgs.append(f"{p['fixture_no']}: {p['conflict_detail']}")
+                compat = dict(p)
+                compat["type"] = p.get("conflict_type", "")
+                combined_conflicts.append(compat)
+            err = ValueError(f"还有 {len(combined_conflicts)} 条冲突未处理，请在冲突工作台中处理后再提交:\n" + "\n".join(conflict_msgs))
+            err.conflicts = combined_conflicts
             raise err
 
         selected_items = self.db.get_selected_draft_items(draft_id)
@@ -1329,16 +1544,26 @@ class LightingService:
         batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
         source_name = draft["source_file"]
 
+        all_draft_items = self.db.get_draft_items(draft_id)
+
         self.db.begin_transaction()
         try:
             batch_id = self.db.create_import_batch(batch_no, operator, source_name, len(selected_items))
 
             counts = {RESULT_NEW: 0, RESULT_UPDATE: 0, RESULT_SKIP: 0, RESULT_ERROR: 0}
+            resolution_counts = {
+                RESOLUTION_ACTION_ORIGINAL: 0,
+                RESOLUTION_ACTION_REFRESH: 0,
+                RESOLUTION_ACTION_DISCARD: 0,
+                "none": 0,
+            }
 
             for item in selected_items:
                 fixture_no = item["fixture_no"]
                 result = item["result"]
                 row_idx = item["row_index"]
+                resolution_action = item.get("resolution_action", RESOLUTION_ACTION_NONE)
+                resolution_note = item.get("resolution_note", "")
 
                 before = json.loads(item["before_snapshot"]) if item["before_snapshot"] else None
                 after_obj = json.loads(item["after_snapshot"]) if item["after_snapshot"] else None
@@ -1346,7 +1571,19 @@ class LightingService:
 
                 before_snap = item["before_snapshot"]
                 after_snap = ""
-                error_msg = ""
+                error_msg_parts = []
+                if resolution_action == RESOLUTION_ACTION_REFRESH:
+                    error_msg_parts.append("[刷新后提交]")
+                elif resolution_action == RESOLUTION_ACTION_ORIGINAL:
+                    error_msg_parts.append("[原样提交]")
+                if resolution_note:
+                    error_msg_parts.append(f"备注: {resolution_note}")
+                error_msg = " ".join(error_msg_parts)
+
+                if resolution_action in resolution_counts:
+                    resolution_counts[resolution_action] += 1
+                else:
+                    resolution_counts["none"] += 1
 
                 if result == RESULT_NEW:
                     status_val = (after_obj.get("status") if after_obj else None) or STATUS_AVAILABLE
@@ -1404,26 +1641,48 @@ class LightingService:
                     batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
                 )
 
+            for item in all_draft_items:
+                if item.get("resolution_action") == RESOLUTION_ACTION_DISCARD:
+                    resolution_counts[RESOLUTION_ACTION_DISCARD] += 1
+                    self.db.add_import_batch_item(
+                        batch_id, item["fixture_no"], item["row_index"], RESULT_SKIP,
+                        f"[放弃] {item.get('resolution_note', '')}".strip(),
+                        item["before_snapshot"], item["after_snapshot"],
+                    )
+
             self.db.update_import_batch_counts(
                 batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
             )
-            self.db.update_import_batch_status(batch_id, "completed")
+            status_msg = (
+                f"原样提交: {resolution_counts[RESOLUTION_ACTION_ORIGINAL]} | "
+                f"刷新后提交: {resolution_counts[RESOLUTION_ACTION_REFRESH]} | "
+                f"放弃: {resolution_counts[RESOLUTION_ACTION_DISCARD]}"
+            )
+            self.db.update_import_batch_status(batch_id, "completed", status_msg)
 
             self.db.update_draft_batch(draft_id, status="submitted")
 
             self.db.commit()
 
-            return {
+            result_obj = {
                 "batch_id": batch_id,
                 "batch_no": batch_no,
+                "success": True,
+                "resolution_original": resolution_counts[RESOLUTION_ACTION_ORIGINAL],
+                "resolution_refresh": resolution_counts[RESOLUTION_ACTION_REFRESH],
+                "resolution_discard": resolution_counts[RESOLUTION_ACTION_DISCARD],
                 "summary": {
                     "total": len(selected_items),
                     "new": counts[RESULT_NEW],
                     "update": counts[RESULT_UPDATE],
                     "skip": counts[RESULT_SKIP],
                     "error": counts[RESULT_ERROR],
+                    "resolution_original": resolution_counts[RESOLUTION_ACTION_ORIGINAL],
+                    "resolution_refresh": resolution_counts[RESOLUTION_ACTION_REFRESH],
+                    "resolution_discard": resolution_counts[RESOLUTION_ACTION_DISCARD],
                 },
             }
+            return result_obj
 
         except Exception as e:
             self.db.rollback_transaction()
@@ -1448,7 +1707,7 @@ class LightingService:
         filepath = dir_path / filename
         with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["行号", "灯具编号", "结果", "是否选中", "信息", "变更详情"])
+            writer.writerow(["行号", "灯具编号", "结果", "是否选中", "信息", "变更详情", "冲突状态", "处理方式", "处理备注"])
             for item in items:
                 detail_parts = []
                 if item["before_snapshot"] and item["after_snapshot"]:
@@ -1464,7 +1723,133 @@ class LightingService:
                 detail = "; ".join(detail_parts)
                 selected_str = "是" if item["selected"] else "否"
                 msg = item["error_message"] or (item["result"] == RESULT_NEW and "新增") or (item["result"] == RESULT_UPDATE and "更新") or (item["result"] == RESULT_SKIP and "跳过（无变化）") or ""
-                writer.writerow([item["row_index"], item["fixture_no"], item["result"], selected_str, msg, detail])
+                conflict_status_display = {
+                    CONFLICT_STATUS_NONE: "无",
+                    CONFLICT_STATUS_PENDING: "待处理",
+                    CONFLICT_STATUS_RESOLVED: "已处理",
+                    CONFLICT_STATUS_DISCARDED: "已放弃",
+                }.get(item.get("conflict_status", ""), item.get("conflict_status", ""))
+                resolution_display = {
+                    RESOLUTION_ACTION_NONE: "未处理",
+                    RESOLUTION_ACTION_ORIGINAL: "原样提交",
+                    RESOLUTION_ACTION_REFRESH: "刷新后提交",
+                    RESOLUTION_ACTION_DISCARD: "放弃",
+                }.get(item.get("resolution_action", ""), item.get("resolution_action", ""))
+                writer.writerow([
+                    item["row_index"], item["fixture_no"], item["result"], selected_str, msg, detail,
+                    conflict_status_display, resolution_display, item.get("resolution_note", "")
+                ])
+        return str(filepath)
+
+    def export_draft_conflicts(self, draft_id, directory, filename):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+
+        conflict_items = self.db.get_draft_items_with_conflicts(draft_id)
+
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                "行号", "灯具编号", "冲突类型", "冲突原因",
+                "草稿值-型号", "草稿值-状态", "草稿值-库位", "草稿值-负责人",
+                "库内值-型号", "库内值-状态", "库内值-库位", "库内值-负责人",
+                "处理状态", "处理方式", "处理备注", "处理时间"
+            ])
+            for item in conflict_items:
+                draft_snap = {}
+                if item.get("after_snapshot"):
+                    try:
+                        draft_snap = json.loads(item["after_snapshot"])
+                    except Exception:
+                        draft_snap = {}
+                if not draft_snap and item.get("record_data"):
+                    try:
+                        draft_snap = json.loads(item["record_data"])
+                    except Exception:
+                        draft_snap = {}
+                db_snap = {}
+                if item.get("current_db_snapshot"):
+                    try:
+                        db_snap = json.loads(item["current_db_snapshot"])
+                    except Exception:
+                        db_snap = {}
+                conflict_type_display = {
+                    "new_conflict": "新增冲突（已存在）",
+                    "update_conflict_deleted": "更新冲突（已删除）",
+                    "update_conflict_changed": "更新冲突（数据已变）",
+                    "other_batch_conflict": "其他批次修改",
+                }.get(item.get("conflict_type", ""), item.get("conflict_type", ""))
+                conflict_status_display = {
+                    CONFLICT_STATUS_PENDING: "待处理",
+                    CONFLICT_STATUS_RESOLVED: "已处理",
+                    CONFLICT_STATUS_DISCARDED: "已放弃",
+                }.get(item.get("conflict_status", ""), item.get("conflict_status", ""))
+                resolution_display = {
+                    RESOLUTION_ACTION_NONE: "未处理",
+                    RESOLUTION_ACTION_ORIGINAL: "原样提交",
+                    RESOLUTION_ACTION_REFRESH: "刷新后提交",
+                    RESOLUTION_ACTION_DISCARD: "放弃",
+                }.get(item.get("resolution_action", ""), item.get("resolution_action", ""))
+                writer.writerow([
+                    item["row_index"], item["fixture_no"],
+                    conflict_type_display, item.get("conflict_detail", ""),
+                    draft_snap.get("model", ""), draft_snap.get("status", ""),
+                    draft_snap.get("location", ""), draft_snap.get("person_in_charge", ""),
+                    db_snap.get("model", ""), db_snap.get("status", ""),
+                    db_snap.get("location", ""), db_snap.get("person_in_charge", ""),
+                    conflict_status_display, resolution_display,
+                    item.get("resolution_note", ""), item.get("resolved_at", ""),
+                ])
+        return str(filepath)
+
+    def export_batch_final_detail(self, batch_id, directory, filename):
+        batch = self.db.get_import_batch(batch_id)
+        if not batch:
+            raise ValueError("批次不存在")
+        detail = self.get_import_batch_detail(batch_id)
+        if not detail:
+            raise ValueError("批次明细不存在")
+
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["行号", "灯具编号", "结果", "处理方式", "信息", "变更详情"])
+            for item in detail["items"]:
+                detail_parts = []
+                if item.get("before_snapshot") and item.get("after_snapshot"):
+                    before = item.get("before_obj") or {}
+                    after = item.get("after_obj") or {}
+                    for field in ["model", "accessories", "location", "inspection_due_date", "person_in_charge", "status"]:
+                        old_val = before.get(field, "")
+                        new_val = after.get(field, "")
+                        if field == "status" and not new_val:
+                            continue
+                        if new_val and new_val != old_val:
+                            detail_parts.append(f"{field}: {old_val} → {new_val}")
+                detail_str = "; ".join(detail_parts)
+                msg = item.get("error_message", "")
+                submit_type = "原样"
+                if "[刷新后提交]" in msg:
+                    submit_type = "刷新后"
+                elif "[放弃]" in msg:
+                    submit_type = "放弃"
+                elif "[原样提交]" in msg:
+                    submit_type = "原样"
+                writer.writerow([item["row_index"], item["fixture_no"], item["result"], submit_type, msg, detail_str])
         return str(filepath)
 
 
@@ -1943,7 +2328,7 @@ class DraftListDialog(tk.Toplevel):
 class DraftEditDialog(tk.Toplevel):
     def __init__(self, parent, service, draft_id, source_filepath=None):
         super().__init__(parent)
-        self.title("编辑导入草稿")
+        self.title("编辑导入草稿 - 冲突处理工作台")
         self.result = None
         self.service = service
         self.draft_id = draft_id
@@ -1961,6 +2346,11 @@ class DraftEditDialog(tk.Toplevel):
         if not self.source_filepath:
             self.source_filepath = self.detail["draft"].get("source_file_path", "") or None
 
+        try:
+            self.service.detect_and_persist_conflicts(self.draft_id, self.source_filepath)
+        except Exception:
+            pass
+
         main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
@@ -1968,6 +2358,9 @@ class DraftEditDialog(tk.Toplevel):
         info_frame.pack(fill="x", pady=(0, 8))
 
         draft = self.detail["draft"]
+        self.conflict_summary_label = ttk.Label(info_frame, text="", foreground="#c62828", font=("Arial", 9, "bold"))
+        self.conflict_summary_label.pack(anchor="e", pady=(0, 4))
+
         info_text = (
             f"草稿号: {draft['draft_no']}    "
             f"操作人: {draft['operator']}    "
@@ -1985,7 +2378,36 @@ class DraftEditDialog(tk.Toplevel):
         self.remark_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(remark_frame, text="保存备注", command=self._on_save_remark, width=10).pack(side="left", padx=8)
 
-        filter_frame = ttk.LabelFrame(main, text="快捷选择", padding=8)
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill="both", expand=True, pady=(0, 8))
+
+        self._build_all_items_tab()
+        self._build_conflict_workbench_tab()
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(0, 0))
+
+        self.summary_label = ttk.Label(btn_frame, text="")
+        self.summary_label.pack(side="left", padx=4)
+
+        ttk.Button(btn_frame, text="重新检测冲突", command=self._on_recheck_conflicts, width=14).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="导出冲突清单", command=self._on_export_conflicts, width=12).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="导出草稿明细", command=self._on_export_draft, width=12).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="提交选中记录", command=self._on_submit, width=14).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=10).pack(side="right")
+
+        self._update_summary()
+        self._update_conflict_summary()
+
+        self.geometry("1150x780")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _build_all_items_tab(self):
+        tab_all = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(tab_all, text=" 全部记录 ")
+
+        filter_frame = ttk.LabelFrame(tab_all, text="快捷选择", padding=8)
         filter_frame.pack(fill="x", pady=(0, 8))
 
         ttk.Button(filter_frame, text="全选", command=lambda: self._set_all_selected(True), width=8).pack(side="left", padx=2)
@@ -1999,17 +2421,21 @@ class DraftEditDialog(tk.Toplevel):
         ttk.Button(filter_frame, text=f"选全部跳过", command=lambda: self._set_by_result(RESULT_SKIP, True), width=10).pack(side="left", padx=2)
         ttk.Button(filter_frame, text=f"取消跳过", command=lambda: self._set_by_result(RESULT_SKIP, False), width=10).pack(side="left", padx=2)
 
-        cols = ("selected", "row", "fixture_no", "result", "detail")
-        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=18)
+        cols = ("selected", "row", "fixture_no", "result", "conflict_status", "resolution", "detail")
+        self.tree = ttk.Treeview(tab_all, columns=cols, show="headings", height=18)
         self.tree.heading("selected", text="选中", anchor="center")
         self.tree.heading("row", text="行号", anchor="center")
         self.tree.heading("fixture_no", text="灯具编号", anchor="center")
         self.tree.heading("result", text="结果", anchor="center")
+        self.tree.heading("conflict_status", text="冲突状态", anchor="center")
+        self.tree.heading("resolution", text="处理方式", anchor="center")
         self.tree.heading("detail", text="详情", anchor="w")
         self.tree.column("selected", width=50, anchor="center")
-        self.tree.column("row", width=60, anchor="center")
-        self.tree.column("fixture_no", width=100, anchor="center")
-        self.tree.column("result", width=80, anchor="center")
+        self.tree.column("row", width=55, anchor="center")
+        self.tree.column("fixture_no", width=90, anchor="center")
+        self.tree.column("result", width=65, anchor="center")
+        self.tree.column("conflict_status", width=75, anchor="center")
+        self.tree.column("resolution", width=90, anchor="center")
         self.tree.column("detail", width=520, anchor="w")
 
         result_tags = {
@@ -2020,31 +2446,86 @@ class DraftEditDialog(tk.Toplevel):
         }
         for tag, color in result_tags.values():
             self.tree.tag_configure(tag, foreground=color)
+        self.tree.tag_configure("conflict_pending", background="#fff3e0")
+        self.tree.tag_configure("conflict_resolved", background="#e8f5e9")
+        self.tree.tag_configure("conflict_discarded", background="#f5f5f5")
 
         self.tree.bind("<Button-1>", self._on_tree_click)
 
-        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        tree_frame = ttk.Frame(tab_all)
+        tree_frame.pack(fill="both", expand=True)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
         self._refresh_items()
 
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill="x", pady=(10, 0))
+    def _build_conflict_workbench_tab(self):
+        tab_conflict = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(tab_conflict, text=" 冲突处理工作台 ")
 
-        self.summary_label = ttk.Label(btn_frame, text="")
-        self.summary_label.pack(side="left", padx=4)
+        header_frame = ttk.Frame(tab_conflict)
+        header_frame.pack(fill="x", pady=(0, 6))
+        ttk.Label(header_frame, text="说明：对于每一条冲突，可选择「按库内最新状态刷新后继续编辑」、「保持草稿原样提交」或「放弃这条记录」。所有处理会自动保存。",
+                  foreground="#555", wraplength=1050, justify="left").pack(anchor="w")
 
-        ttk.Button(btn_frame, text="检测冲突", command=self._on_check_conflicts, width=12).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="提交选中记录", command=self._on_submit, width=14).pack(side="right", padx=4)
-        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=10).pack(side="right")
+        batch_btn_frame = ttk.Frame(tab_conflict)
+        batch_btn_frame.pack(fill="x", pady=(0, 6))
+        ttk.Button(batch_btn_frame, text="全部刷新", command=self._on_batch_refresh, width=12).pack(side="left", padx=2)
+        ttk.Button(batch_btn_frame, text="全部保持原样", command=self._on_batch_keep_original, width=14).pack(side="left", padx=2)
+        ttk.Button(batch_btn_frame, text="全部放弃", command=self._on_batch_discard, width=12).pack(side="left", padx=2)
+        ttk.Separator(batch_btn_frame, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(batch_btn_frame, text="刷新列表", command=self._refresh_conflict_tree, width=10).pack(side="left", padx=2)
 
-        self._update_summary()
+        conflict_cols = (
+            "fixture_no", "conflict_type", "conflict_reason",
+            "draft_model", "draft_status", "draft_location",
+            "db_model", "db_status", "db_location",
+            "resolution_action", "resolution_note"
+        )
+        self.conflict_tree = ttk.Treeview(tab_conflict, columns=conflict_cols, show="headings", height=14)
+        conflict_headers = [
+            ("fixture_no", "灯具编号", 80),
+            ("conflict_type", "冲突类型", 100),
+            ("conflict_reason", "冲突原因", 200),
+            ("draft_model", "草稿-型号", 100),
+            ("draft_status", "草稿-状态", 70),
+            ("draft_location", "草稿-库位", 70),
+            ("db_model", "库内-型号", 100),
+            ("db_status", "库内-状态", 70),
+            ("db_location", "库内-库位", 70),
+            ("resolution_action", "处理方式", 90),
+            ("resolution_note", "处理备注", 180),
+        ]
+        for col_id, col_name, col_w in conflict_headers:
+            self.conflict_tree.heading(col_id, text=col_name, anchor="center")
+            self.conflict_tree.column(col_id, width=col_w, anchor="center" if col_id != "conflict_reason" and col_id != "resolution_note" else "w")
 
-        self.geometry("950x700")
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.wait_window()
+        self.conflict_tree.tag_configure("pending", background="#fff3e0")
+        self.conflict_tree.tag_configure("resolved", background="#e8f5e9")
+        self.conflict_tree.tag_configure("discarded", background="#f5f5f5")
+
+        action_frame = ttk.Frame(tab_conflict)
+        action_frame.pack(fill="x", pady=(6, 0))
+
+        ttk.Label(action_frame, text="对选中冲突:").pack(side="left", padx=(0, 4))
+        ttk.Button(action_frame, text="按库内刷新", command=self._on_action_refresh, width=14).pack(side="left", padx=2)
+        ttk.Button(action_frame, text="保持草稿原样", command=self._on_action_keep_original, width=14).pack(side="left", padx=2)
+        ttk.Button(action_frame, text="放弃此条", command=self._on_action_discard, width=12).pack(side="left", padx=2)
+        ttk.Separator(action_frame, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(action_frame, text="添加/修改备注", command=self._on_action_add_note, width=14).pack(side="left", padx=2)
+
+        tree_wrap_frame = ttk.Frame(tab_conflict)
+        tree_wrap_frame.pack(fill="both", expand=True, pady=(6, 0))
+        cvsb = ttk.Scrollbar(tree_wrap_frame, orient="vertical", command=self.conflict_tree.yview)
+        chsb = ttk.Scrollbar(tree_wrap_frame, orient="horizontal", command=self.conflict_tree.xview)
+        self.conflict_tree.configure(yscrollcommand=cvsb.set, xscrollcommand=chsb.set)
+        self.conflict_tree.pack(side="left", fill="both", expand=True)
+        cvsb.pack(side="right", fill="y")
+        chsb.pack(side="bottom", fill="x")
+
+        self._refresh_conflict_tree()
 
     def _refresh_items(self):
         self.tree.delete(*self.tree.get_children())
@@ -2071,11 +2552,104 @@ class DraftEditDialog(tk.Toplevel):
                 detail_parts.append("更新: " + "; ".join(changes))
             elif item["result"] == RESULT_SKIP:
                 detail_parts.append("数据无变化")
+            if item.get("conflict_detail"):
+                detail_parts.append("冲突: " + item["conflict_detail"])
             detail = " | ".join(detail_parts)
             tag_name = item["result"]
+            conflict_status = item.get("conflict_status", "")
+            extra_tags = ()
+            if conflict_status == CONFLICT_STATUS_PENDING:
+                extra_tags = ("conflict_pending",)
+            elif conflict_status == CONFLICT_STATUS_RESOLVED:
+                extra_tags = ("conflict_resolved",)
+            elif conflict_status == CONFLICT_STATUS_DISCARDED:
+                extra_tags = ("conflict_discarded",)
+            conflict_status_display = {
+                CONFLICT_STATUS_NONE: "",
+                CONFLICT_STATUS_PENDING: "待处理",
+                CONFLICT_STATUS_RESOLVED: "已处理",
+                CONFLICT_STATUS_DISCARDED: "已放弃",
+            }.get(conflict_status, conflict_status)
+            resolution_display = {
+                RESOLUTION_ACTION_NONE: "",
+                RESOLUTION_ACTION_ORIGINAL: "原样提交",
+                RESOLUTION_ACTION_REFRESH: "刷新后提交",
+                RESOLUTION_ACTION_DISCARD: "放弃",
+            }.get(item.get("resolution_action", ""), item.get("resolution_action", ""))
             self.tree.insert("", "end", iid=str(item["id"]),
-                             values=(selected_str, item["row_index"], item["fixture_no"], item["result"], detail),
-                             tags=(tag_name,))
+                             values=(selected_str, item["row_index"], item["fixture_no"], item["result"],
+                                     conflict_status_display, resolution_display, detail),
+                             tags=(tag_name,) + extra_tags)
+
+    def _refresh_conflict_tree(self):
+        self.conflict_tree.delete(*self.conflict_tree.get_children())
+        self.detail = self.service.get_draft_detail(self.draft_id)
+        conflict_items = self.service.db.get_draft_items_with_conflicts(self.draft_id)
+
+        conflict_type_display = {
+            "new_conflict": "新增冲突",
+            "update_conflict_deleted": "灯具已删除",
+            "update_conflict_changed": "数据已变更",
+            "other_batch_conflict": "其他批次修改",
+        }
+        resolution_display = {
+            RESOLUTION_ACTION_NONE: "待处理",
+            RESOLUTION_ACTION_ORIGINAL: "原样提交",
+            RESOLUTION_ACTION_REFRESH: "刷新后提交",
+            RESOLUTION_ACTION_DISCARD: "放弃",
+        }
+
+        conflict_items_by_id = {c["id"]: c for c in conflict_items}
+
+        for item in self.detail["items"]:
+            if not item.get("conflict_type") and item["id"] not in conflict_items_by_id:
+                continue
+            ci = conflict_items_by_id.get(item["id"], item)
+            draft_snap = item.get("after_obj") or item.get("record_obj") or {}
+            db_snap = item.get("current_db_obj") or {}
+            if not db_snap and ci.get("current_db_snapshot"):
+                try:
+                    db_snap = json.loads(ci["current_db_snapshot"])
+                except Exception:
+                    db_snap = {}
+            ctype = ci.get("conflict_type", item.get("conflict_type", ""))
+            status = ci.get("conflict_status", item.get("conflict_status", CONFLICT_STATUS_PENDING))
+            action = ci.get("resolution_action", item.get("resolution_action", RESOLUTION_ACTION_NONE))
+            note = ci.get("resolution_note", item.get("resolution_note", ""))
+            reason = ci.get("conflict_detail", item.get("conflict_detail", ""))
+            tag = "pending"
+            if status == CONFLICT_STATUS_RESOLVED:
+                tag = "resolved"
+            elif status == CONFLICT_STATUS_DISCARDED:
+                tag = "discarded"
+            self.conflict_tree.insert("", "end", iid=str(item["id"]), values=(
+                item["fixture_no"],
+                conflict_type_display.get(ctype, ctype),
+                reason,
+                draft_snap.get("model", ""),
+                draft_snap.get("status", ""),
+                draft_snap.get("location", ""),
+                db_snap.get("model", "—") if db_snap else "—",
+                db_snap.get("status", "—") if db_snap else "—",
+                db_snap.get("location", "—") if db_snap else "—",
+                resolution_display.get(action, action),
+                note,
+            ), tags=(tag,))
+
+    def _update_conflict_summary(self):
+        summary = self.service.get_draft_conflicts_summary(self.draft_id)
+        if summary["total_conflicts"] > 0:
+            self.conflict_summary_label.config(
+                text=f"⚠ 冲突: {summary['pending']} 待处理 | {summary['resolved']} 已处理 | {summary['discarded']} 已放弃",
+                foreground="#c62828" if summary["pending"] > 0 else "#2e7d32"
+            )
+            if summary["pending"] > 0:
+                self.notebook.tab(1, text=f" 冲突处理工作台 ({summary['pending']}) ")
+            else:
+                self.notebook.tab(1, text=" 冲突处理工作台 ")
+        else:
+            self.conflict_summary_label.config(text="✓ 暂无冲突", foreground="#2e7d32")
+            self.notebook.tab(1, text=" 冲突处理工作台 ")
 
     def _update_summary(self):
         counts = self.service.db.count_draft_items_by_result(self.draft_id)
@@ -2120,6 +2694,137 @@ class DraftEditDialog(tk.Toplevel):
         self._refresh_items()
         self._update_summary()
 
+    def _get_selected_conflict_item_ids(self):
+        sel = self.conflict_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在冲突工作台中选择一条或多条冲突记录")
+            return []
+        return [int(iid) for iid in sel]
+
+    def _prompt_note(self, default=""):
+        dlg = FormDialog(self, "添加处理备注", [("note", "备注", default)])
+        if dlg.result is None:
+            return None
+        return dlg.result.get("note", "").strip()
+
+    def _on_action_refresh(self):
+        ids = self._get_selected_conflict_item_ids()
+        if not ids:
+            return
+        note = self._prompt_note()
+        if note is None:
+            return
+        try:
+            for item_id in ids:
+                self.service.refresh_draft_item_from_db(item_id, note)
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已将 {len(ids)} 条记录按库内最新状态刷新")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_action_keep_original(self):
+        ids = self._get_selected_conflict_item_ids()
+        if not ids:
+            return
+        note = self._prompt_note()
+        if note is None:
+            return
+        try:
+            for item_id in ids:
+                self.service.keep_original_draft_item(item_id, note)
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已标记 {len(ids)} 条记录按草稿原样提交")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_action_discard(self):
+        ids = self._get_selected_conflict_item_ids()
+        if not ids:
+            return
+        note = self._prompt_note()
+        if note is None:
+            return
+        if not messagebox.askyesno("确认放弃", f"确定要放弃选中的 {len(ids)} 条记录吗？\n这些记录将不会被提交。"):
+            return
+        try:
+            for item_id in ids:
+                self.service.discard_draft_item(item_id, note)
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已放弃 {len(ids)} 条记录")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_action_add_note(self):
+        ids = self._get_selected_conflict_item_ids()
+        if not ids:
+            return
+        try:
+            current_note = ""
+            if len(ids) == 1:
+                row = self.service.db.execute("SELECT resolution_note FROM import_draft_items WHERE id=?", (ids[0],)).fetchone()
+                if row:
+                    current_note = row["resolution_note"] or ""
+            note = self._prompt_note(current_note)
+            if note is None:
+                return
+            for item_id in ids:
+                self.service.set_item_resolution_note(item_id, note)
+            self._refresh_all_views()
+            messagebox.showinfo("成功", "备注已更新")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_batch_refresh(self):
+        pending = self.service.db.get_draft_items_pending_conflicts(self.draft_id)
+        if not pending:
+            messagebox.showinfo("提示", "没有待处理的冲突")
+            return
+        if not messagebox.askyesno("确认", f"确定要将全部 {len(pending)} 条待处理冲突按库内最新状态刷新吗？"):
+            return
+        try:
+            for p in pending:
+                self.service.refresh_draft_item_from_db(p["id"], "批量刷新")
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已批量刷新 {len(pending)} 条记录")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_batch_keep_original(self):
+        pending = self.service.db.get_draft_items_pending_conflicts(self.draft_id)
+        if not pending:
+            messagebox.showinfo("提示", "没有待处理的冲突")
+            return
+        if not messagebox.askyesno("确认", f"确定要将全部 {len(pending)} 条待处理冲突按草稿原样提交吗？"):
+            return
+        try:
+            for p in pending:
+                self.service.keep_original_draft_item(p["id"], "批量原样提交")
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已批量标记 {len(pending)} 条记录")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_batch_discard(self):
+        pending = self.service.db.get_draft_items_pending_conflicts(self.draft_id)
+        if not pending:
+            messagebox.showinfo("提示", "没有待处理的冲突")
+            return
+        if not messagebox.askyesno("确认", f"确定要放弃全部 {len(pending)} 条待处理冲突记录吗？"):
+            return
+        try:
+            for p in pending:
+                self.service.discard_draft_item(p["id"], "批量放弃")
+            self._refresh_all_views()
+            messagebox.showinfo("成功", f"已批量放弃 {len(pending)} 条记录")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _refresh_all_views(self):
+        self._refresh_items()
+        self._refresh_conflict_tree()
+        self._update_summary()
+        self._update_conflict_summary()
+
     def _on_save_remark(self):
         remark = self.remark_var.get().strip()
         try:
@@ -2128,23 +2833,67 @@ class DraftEditDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
-    def _on_check_conflicts(self):
+    def _on_recheck_conflicts(self):
         try:
-            conflicts = self.service._detect_draft_conflicts(self.draft_id, self.source_filepath)
+            conflicts = self.service.detect_and_persist_conflicts(self.draft_id, self.source_filepath)
+            self._refresh_all_views()
             if not conflicts:
                 messagebox.showinfo("冲突检测", "未检测到冲突，选中的记录可以安全提交")
             else:
-                conflict_msgs = []
-                for c in conflicts:
-                    if c["fixture_no"]:
-                        conflict_msgs.append(f"{c['fixture_no']}: {c['detail']}")
-                    else:
-                        conflict_msgs.append(c["detail"])
-                messagebox.showwarning("检测到冲突",
-                                       f"发现 {len(conflicts)} 个冲突:\n\n" + "\n".join(conflict_msgs) +
-                                       "\n\n请处理冲突后再提交。")
+                item_conflicts = [c for c in conflicts if c.get("item_id")]
+                file_conflicts = [c for c in conflicts if not c.get("item_id")]
+                msg = f"共发现 {len(conflicts)} 个问题:\n  - 记录冲突: {len(item_conflicts)} 条\n"
+                if file_conflicts:
+                    msg += f"  - 文件问题: {len(file_conflicts)} 条\n"
+                msg += "\n请切换到「冲突处理工作台」标签页处理。"
+                if file_conflicts:
+                    msg += "\n\n文件问题:\n" + "\n".join("  - " + c["detail"] for c in file_conflicts)
+                messagebox.showwarning("检测到冲突", msg)
+                if len(item_conflicts) > 0:
+                    self.notebook.select(1)
         except Exception as e:
             messagebox.showerror("检测失败", str(e))
+
+    def _on_check_conflicts(self):
+        self._on_recheck_conflicts()
+
+    def _on_export_conflicts(self):
+        export_dir = self.service.get_export_dir()
+        from tkinter import filedialog
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择冲突清单导出目录", parent=self)
+        if not directory:
+            return
+        draft = self.service.db.get_draft_batch(self.draft_id)
+        if not draft:
+            return
+        filename = f"冲突清单_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_draft_conflicts(self.draft_id, directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"冲突清单已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出时发生错误:\n{e}")
+
+    def _on_export_draft(self):
+        export_dir = self.service.get_export_dir()
+        from tkinter import filedialog
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择草稿明细导出目录", parent=self)
+        if not directory:
+            return
+        draft = self.service.db.get_draft_batch(self.draft_id)
+        if not draft:
+            return
+        filename = f"草稿明细_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_draft_items(self.draft_id, directory, filename, selected_only=False)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"草稿明细已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出时发生错误:\n{e}")
 
     def _on_submit(self):
         selected = self.service.db.get_selected_draft_items(self.draft_id)
@@ -2156,11 +2905,17 @@ class DraftEditDialog(tk.Toplevel):
             messagebox.showerror("错误", f"选中的记录中有 {len(error_items)} 条错误记录，请先取消选中或修正后再提交")
             return
 
-        if not messagebox.askyesno("确认提交",
-                                    f"确定要提交选中的 {len(selected)} 条记录吗？\n\n"
-                                    f"新增: {sum(1 for it in selected if it['result']==RESULT_NEW)} 条\n"
-                                    f"更新: {sum(1 for it in selected if it['result']==RESULT_UPDATE)} 条\n"
-                                    f"跳过: {sum(1 for it in selected if it['result']==RESULT_SKIP)} 条"):
+        conflict_summary = self.service.get_draft_conflicts_summary(self.draft_id)
+        pending_count = conflict_summary["pending"]
+        submit_msg = f"确定要提交选中的 {len(selected)} 条记录吗？\n\n"
+        submit_msg += f"新增: {sum(1 for it in selected if it['result']==RESULT_NEW)} 条\n"
+        submit_msg += f"更新: {sum(1 for it in selected if it['result']==RESULT_UPDATE)} 条\n"
+        submit_msg += f"跳过: {sum(1 for it in selected if it['result']==RESULT_SKIP)} 条"
+        if conflict_summary["resolved"] > 0 or conflict_summary["discarded"] > 0:
+            submit_msg += f"\n\n已处理冲突: {conflict_summary['resolved']} 条\n已放弃: {conflict_summary['discarded']} 条"
+        if pending_count > 0:
+            submit_msg += f"\n\n⚠ 警告: 还有 {pending_count} 条冲突未处理，提交会被拦截！"
+        if not messagebox.askyesno("确认提交", submit_msg):
             return
 
         fields = [("operator", "操作人", self.detail["draft"]["operator"])]
@@ -2174,10 +2929,38 @@ class DraftEditDialog(tk.Toplevel):
 
         try:
             result = self.service.submit_draft(self.draft_id, operator, self.source_filepath)
+            summary = result["summary"]
+            extra_info = ""
+            if summary.get("resolution_original") or summary.get("resolution_refresh") or summary.get("resolution_discard"):
+                extra_info = (
+                    f"\n\n提交方式统计:\n"
+                    f"  原样提交: {summary.get('resolution_original', 0)} 条\n"
+                    f"  刷新后提交: {summary.get('resolution_refresh', 0)} 条\n"
+                    f"  放弃: {summary.get('resolution_discard', 0)} 条"
+                )
+            if messagebox.askyesno("提交成功",
+                                    f"提交成功！批次号: {result['batch_no']}\n\n"
+                                    f"共 {summary.get('total', 0)} 条:\n"
+                                    f"  新增: {summary.get('new', 0)} 条\n"
+                                    f"  更新: {summary.get('update', 0)} 条\n"
+                                    f"  跳过: {summary.get('skip', 0)} 条"
+                                    f"{extra_info}\n\n是否导出最终明细？"):
+                try:
+                    export_dir = self.service.get_export_dir()
+                    from tkinter import filedialog
+                    directory = filedialog.askdirectory(initialdir=export_dir, title="选择最终明细导出目录", parent=self)
+                    if directory:
+                        filename = f"最终明细_{result['batch_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                        path = self.service.export_batch_final_detail(result["batch_id"], directory, filename)
+                        self.service.set_export_dir(directory)
+                        messagebox.showinfo("导出成功", f"最终明细已导出到:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("导出失败", str(e))
             self.result = {"action": "submitted", "batch_id": result["batch_id"], "batch_no": result["batch_no"], "summary": result["summary"]}
             self.destroy()
         except ValueError as e:
             messagebox.showerror("提交失败", str(e))
+            self.notebook.select(1)
         except Exception as e:
             messagebox.showerror("提交失败", f"提交时发生错误:\n{e}")
 

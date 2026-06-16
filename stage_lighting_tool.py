@@ -7,7 +7,7 @@ import csv
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 APP_TITLE = "舞台灯光租借巡检管理系统"
@@ -96,6 +96,66 @@ RESOLUTION_ACTION_REFRESH = "refresh"
 RESOLUTION_ACTION_DISCARD = "discard"
 
 ROLLBACK_SAFE_STATUSES = {STATUS_AVAILABLE}
+
+INSPECTION_PLAN_STATUS_PENDING = "待巡检"
+INSPECTION_PLAN_STATUS_COMPLETED = "已完成"
+INSPECTION_PLAN_STATUS_CANCELLED = "已取消"
+
+INSPECTION_PLAN_ALL_STATUSES = [
+    INSPECTION_PLAN_STATUS_PENDING,
+    INSPECTION_PLAN_STATUS_COMPLETED,
+    INSPECTION_PLAN_STATUS_CANCELLED,
+]
+
+INSPECTION_PLAN_STATUS_COLORS = {
+    INSPECTION_PLAN_STATUS_PENDING: "#e65100",
+    INSPECTION_PLAN_STATUS_COMPLETED: "#2e7d32",
+    INSPECTION_PLAN_STATUS_CANCELLED: "#9e9e9e",
+}
+
+INSPECTION_PLAN_RESULT_PASS = "通过"
+INSPECTION_PLAN_RESULT_FAIL = "不通过"
+INSPECTION_PLAN_RESULT_NA = ""
+
+INSPECTION_PLAN_ALL_RESULTS = [
+    INSPECTION_PLAN_RESULT_PASS,
+    INSPECTION_PLAN_RESULT_FAIL,
+]
+
+INSPECTION_PLAN_TABLE_COLUMNS = [
+    ("id", "ID", 40),
+    ("fixture_no", "灯具编号", 90),
+    ("model", "型号", 100),
+    ("plan_date", "计划日期", 100),
+    ("planner", "计划人", 80),
+    ("executor", "执行人", 80),
+    ("status", "状态", 80),
+    ("result", "处理结果", 80),
+    ("completion_remark", "完成备注", 160),
+    ("processed_at", "处理时间", 140),
+]
+
+INSPECTION_PLAN_EXPORT_FIELDS = [
+    "fixture_no", "model", "plan_date", "planner", "executor",
+    "status", "result", "completion_remark", "processed_at",
+]
+INSPECTION_PLAN_EXPORT_HEADERS = [
+    "灯具编号", "型号", "计划日期", "计划人", "执行人",
+    "状态", "处理结果", "完成备注", "处理时间",
+]
+
+INSPECTION_PLAN_IMPORT_REQUIRED_FIELDS = ["fixture_no", "plan_date", "planner"]
+INSPECTION_PLAN_IMPORT_FIELD_MAPPING = {
+    "灯具编号": "fixture_no",
+    "型号": "model",
+    "计划日期": "plan_date",
+    "计划人": "planner",
+    "执行人": "executor",
+    "状态": "status",
+    "处理结果": "result",
+    "完成备注": "completion_remark",
+    "处理时间": "processed_at",
+}
 
 
 class DatabaseManager:
@@ -222,6 +282,39 @@ class DatabaseManager:
                 FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_draft_handover_draft ON draft_handover_log(draft_id);
+            CREATE TABLE IF NOT EXISTS inspection_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fixture_id INTEGER NOT NULL,
+                fixture_no TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                plan_date TEXT NOT NULL,
+                planner TEXT NOT NULL DEFAULT '',
+                executor TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '待巡检',
+                result TEXT NOT NULL DEFAULT '',
+                completion_remark TEXT NOT NULL DEFAULT '',
+                processed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (fixture_id) REFERENCES fixtures(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_inspection_plans_unique ON inspection_plans(fixture_no, plan_date);
+            CREATE INDEX IF NOT EXISTS idx_inspection_plans_date ON inspection_plans(plan_date);
+            CREATE INDEX IF NOT EXISTS idx_inspection_plans_status ON inspection_plans(status);
+            CREATE INDEX IF NOT EXISTS idx_inspection_plans_executor ON inspection_plans(executor);
+            CREATE INDEX IF NOT EXISTS idx_inspection_plans_planner ON inspection_plans(planner);
+            CREATE TABLE IF NOT EXISTS inspection_plan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT NOT NULL DEFAULT '',
+                to_status TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (plan_id) REFERENCES inspection_plans(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_inspection_plan_history_plan ON inspection_plan_history(plan_id);
         """)
         try:
             self.conn.execute("ALTER TABLE import_draft_batches ADD COLUMN source_file_path TEXT NOT NULL DEFAULT ''")
@@ -575,6 +668,100 @@ class DatabaseManager:
 
     def rollback_transaction(self):
         self.conn.rollback()
+
+    def add_inspection_plan(self, fixture_id, fixture_no, model, plan_date, planner, executor=""):
+        cur = self.execute(
+            "INSERT INTO inspection_plans (fixture_id, fixture_no, model, plan_date, planner, executor, status) VALUES (?,?,?,?,?,?,'待巡检')",
+            (fixture_id, fixture_no, model, plan_date, planner, executor),
+        )
+        self.commit()
+        return cur.lastrowid
+
+    def get_inspection_plan(self, plan_id):
+        row = self.execute("SELECT * FROM inspection_plans WHERE id=?", (plan_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_inspection_plan_by_fixture_and_date(self, fixture_no, plan_date):
+        row = self.execute(
+            "SELECT * FROM inspection_plans WHERE fixture_no=? AND plan_date=?",
+            (fixture_no, plan_date),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_inspection_plan(self, plan_id, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [plan_id]
+        self.execute(f"UPDATE inspection_plans SET {sets}, updated_at=datetime('now','localtime') WHERE id=?", vals)
+        self.commit()
+
+    def delete_inspection_plan(self, plan_id):
+        self.execute("DELETE FROM inspection_plan_history WHERE plan_id=?", (plan_id,))
+        self.execute("DELETE FROM inspection_plans WHERE id=?", (plan_id,))
+        self.commit()
+
+    def query_inspection_plans(self, status=None, executor=None, planner=None,
+                                date_start=None, date_end=None, fixture_no=None):
+        sql = "SELECT * FROM inspection_plans WHERE 1=1"
+        params = []
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        if executor:
+            sql += " AND executor=?"
+            params.append(executor)
+        if planner:
+            sql += " AND planner=?"
+            params.append(planner)
+        if date_start:
+            sql += " AND plan_date>=?"
+            params.append(date_start)
+        if date_end:
+            sql += " AND plan_date<=?"
+            params.append(date_end)
+        if fixture_no:
+            sql += " AND fixture_no LIKE ?"
+            params.append(f"%{fixture_no}%")
+        sql += " ORDER BY plan_date DESC, fixture_no"
+        return [dict(r) for r in self.execute(sql, params).fetchall()]
+
+    def add_inspection_plan_history(self, plan_id, action, from_status, to_status, operator, remark=""):
+        self.execute(
+            "INSERT INTO inspection_plan_history (plan_id, action, from_status, to_status, operator, remark) VALUES (?,?,?,?,?,?)",
+            (plan_id, action, from_status, to_status, operator, remark),
+        )
+        self.commit()
+
+    def get_inspection_plan_history(self, plan_id):
+        return [dict(r) for r in self.execute(
+            "SELECT * FROM inspection_plan_history WHERE plan_id=? ORDER BY created_at DESC",
+            (plan_id,),
+        ).fetchall()]
+
+    def get_all_inspection_executors(self):
+        return [r["executor"] for r in self.execute(
+            "SELECT DISTINCT executor FROM inspection_plans WHERE executor!='' ORDER BY executor"
+        ).fetchall()]
+
+    def get_all_inspection_planners(self):
+        return [r["planner"] for r in self.execute(
+            "SELECT DISTINCT planner FROM inspection_plans WHERE planner!='' ORDER BY planner"
+        ).fetchall()]
+
+    def batch_insert_inspection_plans(self, plans):
+        self.begin_transaction()
+        try:
+            for p in plans:
+                self.execute(
+                    "INSERT INTO inspection_plans (fixture_id, fixture_no, model, plan_date, planner, executor, status) VALUES (?,?,?,?,?,?,'待巡检')",
+                    (p["fixture_id"], p["fixture_no"], p.get("model", ""),
+                     p["plan_date"], p["planner"], p.get("executor", "")),
+                )
+            self.commit()
+        except Exception:
+            self.rollback_transaction()
+            raise
 
 
 class LightingService:
@@ -1991,6 +2178,399 @@ class LightingService:
                 writer.writerow([item["row_index"], item["fixture_no"], item["result"], submit_type, msg, detail_str, draft_creator, draft_current_operator, draft_handover_reason])
         return str(filepath)
 
+    def add_inspection_plan(self, fixture_no, plan_date, planner, executor=""):
+        if not fixture_no:
+            raise ValueError("灯具编号不能为空")
+        if not plan_date:
+            raise ValueError("计划日期不能为空")
+        if not planner:
+            raise ValueError("计划人不能为空")
+        try:
+            date.fromisoformat(plan_date)
+        except ValueError:
+            raise ValueError("计划日期格式应为 YYYY-MM-DD")
+
+        fixture = self.db.get_fixture_by_no(fixture_no)
+        if not fixture:
+            raise ValueError(f"灯具编号 '{fixture_no}' 不存在")
+
+        existing = self.db.get_inspection_plan_by_fixture_and_date(fixture_no, plan_date)
+        if existing:
+            raise ValueError(f"灯具 {fixture_no} 在 {plan_date} 已有巡检计划，请勿重复创建")
+
+        plan_id = self.db.add_inspection_plan(
+            fixture["id"], fixture_no, fixture["model"],
+            plan_date, planner, executor,
+        )
+        self.db.add_inspection_plan_history(
+            plan_id, "创建计划", "", INSPECTION_PLAN_STATUS_PENDING,
+            planner, f"创建巡检计划，计划日期: {plan_date}",
+        )
+        return plan_id
+
+    def batch_generate_inspection_plans(self, date_start, date_end, planner,
+                                         status_filter=None, location_filter=None,
+                                         person_in_charge_filter=None):
+        try:
+            date.fromisoformat(date_start)
+        except ValueError:
+            raise ValueError("开始日期格式应为 YYYY-MM-DD")
+        try:
+            date.fromisoformat(date_end)
+        except ValueError:
+            raise ValueError("结束日期格式应为 YYYY-MM-DD")
+        if date_start > date_end:
+            raise ValueError("开始日期不能晚于结束日期")
+        if not planner:
+            raise ValueError("计划人不能为空")
+
+        fixtures = self.db.query_fixtures(
+            location=location_filter or None,
+            status=status_filter or None,
+        )
+
+        if person_in_charge_filter:
+            fixtures = [f for f in fixtures if f["person_in_charge"] == person_in_charge_filter]
+
+        if not fixtures:
+            raise ValueError("没有符合条件的灯具")
+
+        start = date.fromisoformat(date_start)
+        end = date.fromisoformat(date_end)
+        total_days = (end - start).days + 1
+
+        plans = []
+        conflicts = []
+
+        for i, fixture in enumerate(fixtures):
+            plan_day_idx = i % total_days
+            plan_date = (start + timedelta(days=plan_day_idx)).isoformat()
+
+            existing = self.db.get_inspection_plan_by_fixture_and_date(
+                fixture["fixture_no"], plan_date
+            )
+            if existing:
+                conflicts.append({
+                    "fixture_no": fixture["fixture_no"],
+                    "plan_date": plan_date,
+                    "reason": "当日已有计划",
+                })
+                continue
+
+            plans.append({
+                "fixture_id": fixture["id"],
+                "fixture_no": fixture["fixture_no"],
+                "model": fixture["model"],
+                "plan_date": plan_date,
+                "planner": planner,
+                "executor": fixture["person_in_charge"],
+            })
+
+        if plans:
+            self.db.batch_insert_inspection_plans(plans)
+
+        return {
+            "created": len(plans),
+            "conflicts": conflicts,
+            "total_fixtures": len(fixtures),
+        }
+
+    def complete_inspection_plan(self, plan_id, operator, result, remark=""):
+        plan = self.db.get_inspection_plan(plan_id)
+        if not plan:
+            raise ValueError("巡检计划不存在")
+        if plan["status"] == INSPECTION_PLAN_STATUS_COMPLETED:
+            raise ValueError("该巡检计划已完成，请勿重复操作")
+        if plan["status"] == INSPECTION_PLAN_STATUS_CANCELLED:
+            raise ValueError("该巡检计划已取消，无法标记完成")
+        if not operator:
+            raise ValueError("操作人不能为空")
+        if result not in INSPECTION_PLAN_ALL_RESULTS:
+            raise ValueError(f"处理结果必须是以下之一: {', '.join(INSPECTION_PLAN_ALL_RESULTS)}")
+
+        old_status = plan["status"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.update_inspection_plan(
+            plan_id,
+            status=INSPECTION_PLAN_STATUS_COMPLETED,
+            result=result,
+            completion_remark=remark,
+            processed_at=now,
+            executor=operator if not plan["executor"] else plan["executor"],
+        )
+        self.db.add_inspection_plan_history(
+            plan_id, "完成巡检", old_status, INSPECTION_PLAN_STATUS_COMPLETED,
+            operator, f"处理结果: {result}; {remark}",
+        )
+
+    def revert_inspection_plan(self, plan_id, operator, reason=""):
+        plan = self.db.get_inspection_plan(plan_id)
+        if not plan:
+            raise ValueError("巡检计划不存在")
+        if plan["status"] != INSPECTION_PLAN_STATUS_COMPLETED:
+            raise ValueError("只有已完成的巡检计划才能撤回")
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        old_status = plan["status"]
+        old_result = plan["result"]
+        old_remark = plan["completion_remark"]
+
+        self.db.update_inspection_plan(
+            plan_id,
+            status=INSPECTION_PLAN_STATUS_PENDING,
+            result="",
+            completion_remark="",
+            processed_at="",
+        )
+        self.db.add_inspection_plan_history(
+            plan_id, "撤回完成", old_status, INSPECTION_PLAN_STATUS_PENDING,
+            operator,
+            f"撤回原因: {reason or '未填写'}; 原结果: {old_result}; 原备注: {old_remark}",
+        )
+
+    def cancel_inspection_plan(self, plan_id, operator, reason=""):
+        plan = self.db.get_inspection_plan(plan_id)
+        if not plan:
+            raise ValueError("巡检计划不存在")
+        if plan["status"] == INSPECTION_PLAN_STATUS_CANCELLED:
+            raise ValueError("该巡检计划已取消，请勿重复操作")
+        if plan["status"] == INSPECTION_PLAN_STATUS_COMPLETED:
+            raise ValueError("已完成的巡检计划不能取消，请先撤回完成")
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        old_status = plan["status"]
+        self.db.update_inspection_plan(
+            plan_id,
+            status=INSPECTION_PLAN_STATUS_CANCELLED,
+        )
+        self.db.add_inspection_plan_history(
+            plan_id, "取消计划", old_status, INSPECTION_PLAN_STATUS_CANCELLED,
+            operator, f"取消原因: {reason or '未填写'}",
+        )
+
+    def get_inspection_plan(self, plan_id):
+        return self.db.get_inspection_plan(plan_id)
+
+    def get_inspection_plans(self, **filters):
+        return self.db.query_inspection_plans(**filters)
+
+    def get_inspection_plan_history(self, plan_id):
+        return self.db.get_inspection_plan_history(plan_id)
+
+    def get_all_inspection_executors(self):
+        return self.db.get_all_inspection_executors()
+
+    def get_all_inspection_planners(self):
+        return self.db.get_all_inspection_planners()
+
+    def export_inspection_plans_csv(self, plans, directory, filename):
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"导出目录 '{directory}' 不可写，请选择其他目录")
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(INSPECTION_PLAN_EXPORT_HEADERS)
+            for plan in plans:
+                writer.writerow([plan.get(k, "") for k in INSPECTION_PLAN_EXPORT_FIELDS])
+        return str(filepath)
+
+    def export_inspection_plan_template(self, directory, filename):
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"目录 '{directory}' 不存在")
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"目录 '{directory}' 不可写")
+        filepath = dir_path / filename
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(INSPECTION_PLAN_EXPORT_HEADERS)
+            writer.writerow(["L001", "PAR64", "2027-01-15", "张三", "李四", "待巡检", "", "", ""])
+            writer.writerow(["L002", "LED200", "2027-01-16", "张三", "王五", "待巡检", "", "", ""])
+        return str(filepath)
+
+    def parse_inspection_plan_import_file(self, filepath):
+        ext = Path(filepath).suffix.lower()
+        if ext == ".csv":
+            return self._parse_inspection_plan_csv(filepath)
+        elif ext == ".json":
+            return self._parse_inspection_plan_json(filepath)
+        else:
+            raise ValueError(f"不支持的文件格式: {ext}，仅支持 CSV 和 JSON")
+
+    def _parse_inspection_plan_csv(self, filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+        except UnicodeDecodeError:
+            with open(filepath, "r", encoding="gbk") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+
+        if not rows:
+            raise ValueError("CSV 文件为空")
+
+        header_row = rows[0]
+        field_map = {}
+        for i, col in enumerate(header_row):
+            col_stripped = col.strip()
+            if col_stripped in INSPECTION_PLAN_IMPORT_FIELD_MAPPING:
+                field_map[i] = INSPECTION_PLAN_IMPORT_FIELD_MAPPING[col_stripped]
+
+        if "fixture_no" not in field_map.values():
+            raise ValueError("CSV 文件缺少必要列：灯具编号")
+        if "plan_date" not in field_map.values():
+            raise ValueError("CSV 文件缺少必要列：计划日期")
+        if "planner" not in field_map.values():
+            raise ValueError("CSV 文件缺少必要列：计划人")
+
+        records = []
+        for row_idx, row in enumerate(rows[1:], start=2):
+            if not any(cell.strip() for cell in row):
+                continue
+            record = {}
+            for col_idx, value in enumerate(row):
+                if col_idx in field_map:
+                    record[field_map[col_idx]] = value.strip()
+            records.append({"row": row_idx, "record": record})
+
+        return records
+
+    def _parse_inspection_plan_json(self, filepath):
+        with open(filepath, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            raise ValueError("JSON 文件根元素必须是数组")
+        records = []
+        for i, item in enumerate(data, start=2):
+            record = {}
+            for k, v in item.items():
+                if k in INSPECTION_PLAN_IMPORT_FIELD_MAPPING:
+                    record[INSPECTION_PLAN_IMPORT_FIELD_MAPPING[k]] = str(v).strip()
+                elif k in INSPECTION_PLAN_IMPORT_FIELD_MAPPING.values():
+                    record[k] = str(v).strip()
+            records.append({"row": i, "record": record})
+        return records
+
+    def precheck_inspection_plan_import(self, records):
+        results = []
+        summary = {
+            "total": len(records),
+            "new": 0,
+            "error": 0,
+            "conflict": 0,
+        }
+        seen_pairs = set()
+
+        for item in records:
+            row_idx = item["row"]
+            record = item["record"]
+            errors = []
+            conflict = False
+
+            for field in INSPECTION_PLAN_IMPORT_REQUIRED_FIELDS:
+                if not record.get(field):
+                    field_label = {v: k for k, v in INSPECTION_PLAN_IMPORT_FIELD_MAPPING.items()}.get(field, field)
+                    errors.append(f"缺少必填字段: {field_label}")
+
+            plan_date = record.get("plan_date", "")
+            if plan_date:
+                try:
+                    date.fromisoformat(plan_date)
+                except ValueError:
+                    errors.append("计划日期格式错误，应为 YYYY-MM-DD")
+
+            fixture_no = record.get("fixture_no", "")
+            if fixture_no:
+                fixture = self.db.get_fixture_by_no(fixture_no)
+                if not fixture:
+                    errors.append(f"灯具编号 '{fixture_no}' 不存在")
+                else:
+                    record["_fixture_id"] = fixture["id"]
+                    record["_model"] = fixture["model"]
+
+            pair_key = (fixture_no, plan_date)
+            if pair_key in seen_pairs:
+                errors.append("同一文件内重复：相同灯具+日期")
+                conflict = True
+            seen_pairs.add(pair_key)
+
+            if fixture_no and plan_date and not errors:
+                existing = self.db.get_inspection_plan_by_fixture_and_date(fixture_no, plan_date)
+                if existing:
+                    errors.append("库内已存在相同日期的巡检计划")
+                    conflict = True
+
+            if errors:
+                summary["error"] += 1
+                if conflict:
+                    summary["conflict"] += 1
+                result_type = "错误"
+            else:
+                summary["new"] += 1
+                result_type = "新增"
+
+            results.append({
+                "row": row_idx,
+                "fixture_no": fixture_no,
+                "plan_date": plan_date,
+                "result": result_type,
+                "errors": errors,
+                "record": record,
+            })
+
+        return results, summary
+
+    def execute_inspection_plan_import(self, filepath, operator):
+        if not operator:
+            raise ValueError("操作人不能为空")
+
+        try:
+            records = self.parse_inspection_plan_import_file(filepath)
+        except ValueError as e:
+            raise
+        except Exception as e:
+            raise ValueError(f"读取文件时出错: {e}")
+
+        precheck_results, summary = self.precheck_inspection_plan_import(records)
+
+        if summary["error"] > 0:
+            raise ValueError(
+                f"预检发现 {summary['error']} 条错误（含 {summary['conflict']} 条冲突），请修正后再导入"
+            )
+
+        created_ids = []
+        self.db.begin_transaction()
+        try:
+            for pr in precheck_results:
+                if pr["result"] != "新增":
+                    continue
+                rec = pr["record"]
+                plan_id = self.db.add_inspection_plan(
+                    rec["_fixture_id"], rec["fixture_no"], rec.get("_model", ""),
+                    rec["plan_date"], rec["planner"], rec.get("executor", ""),
+                )
+                self.db.add_inspection_plan_history(
+                    plan_id, "创建计划(导入)", "", INSPECTION_PLAN_STATUS_PENDING,
+                    operator, f"从文件 {Path(filepath).name} 导入创建",
+                )
+                created_ids.append(plan_id)
+            self.db.commit()
+        except Exception:
+            self.db.rollback_transaction()
+            raise
+
+        return {
+            "created": len(created_ids),
+            "summary": summary,
+            "plan_ids": created_ids,
+        }
+
 
 class FormDialog(tk.Toplevel):
     def __init__(self, parent, title, fields, initial=None, width=360):
@@ -3216,6 +3796,512 @@ class DraftEditDialog(tk.Toplevel):
         self.destroy()
 
 
+class InspectionPlanDialog(tk.Toplevel):
+    def __init__(self, parent, service):
+        super().__init__(parent)
+        self.service = service
+        self.title("巡检计划台账")
+        self.geometry("1080x700")
+        self.minsize(900, 600)
+        self.resizable(True, True)
+        self.transient(parent)
+
+        self._current_filters = {}
+        self._selected_plan_id = None
+
+        self._build_toolbar()
+        self._build_filter_panel()
+        self._build_main_area()
+        self._build_status_bar()
+        self._refresh_table()
+        self._update_status_bar()
+
+    def _build_toolbar(self):
+        toolbar = ttk.Frame(self, padding=(8, 6))
+        toolbar.pack(fill="x")
+
+        ttk.Button(toolbar, text="批量生成...", command=self._on_batch_generate, width=12).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="新增计划...", command=self._on_add_plan, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="标记完成", command=self._on_complete, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="撤回完成", command=self._on_revert, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="取消计划", command=self._on_cancel, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="导入计划...", command=self._on_import, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="导出结果...", command=self._on_export, width=10).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="导出模板...", command=self._on_export_template, width=10).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="刷新", command=self._refresh_table, width=8).pack(side="left", padx=2)
+
+    def _build_filter_panel(self):
+        frame = ttk.LabelFrame(self, text="筛选", padding=6)
+        frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        ttk.Label(frame, text="状态:").grid(row=0, column=0, padx=(0, 4), pady=2)
+        self.filter_status = ttk.Combobox(frame, width=10, values=[""] + INSPECTION_PLAN_ALL_STATUSES)
+        self.filter_status.grid(row=0, column=1, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="执行人:").grid(row=0, column=2, padx=(0, 4), pady=2)
+        self.filter_executor = ttk.Combobox(frame, width=10, values=[""] + self.service.get_all_inspection_executors())
+        self.filter_executor.grid(row=0, column=3, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="计划人:").grid(row=0, column=4, padx=(0, 4), pady=2)
+        self.filter_planner = ttk.Combobox(frame, width=10, values=[""] + self.service.get_all_inspection_planners())
+        self.filter_planner.grid(row=0, column=5, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="计划起始:").grid(row=0, column=6, padx=(0, 4), pady=2)
+        self.filter_date_start = ttk.Entry(frame, width=11)
+        self.filter_date_start.grid(row=0, column=7, padx=(0, 12), pady=2)
+
+        ttk.Label(frame, text="计划结束:").grid(row=0, column=8, padx=(0, 4), pady=2)
+        self.filter_date_end = ttk.Entry(frame, width=11)
+        self.filter_date_end.grid(row=0, column=9, padx=(0, 12), pady=2)
+
+        ttk.Button(frame, text="筛选", command=self._on_filter).grid(row=0, column=10, padx=4, pady=2)
+        ttk.Button(frame, text="重置", command=self._on_reset_filter).grid(row=0, column=11, padx=4, pady=2)
+
+    def _build_main_area(self):
+        main = ttk.PanedWindow(self, orient="vertical")
+        main.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        top_frame = ttk.Frame(main)
+        main.add(top_frame, weight=3)
+
+        cols = [c[0] for c in INSPECTION_PLAN_TABLE_COLUMNS]
+        self.tree = ttk.Treeview(top_frame, columns=cols, show="headings", selectmode="browse")
+
+        for col_id, col_name, col_w in INSPECTION_PLAN_TABLE_COLUMNS:
+            self.tree.heading(col_id, text=col_name, anchor="center")
+            self.tree.column(col_id, width=col_w, minwidth=40, anchor="center")
+
+        for status_name in INSPECTION_PLAN_ALL_STATUSES:
+            self.tree.tag_configure(status_name, foreground=INSPECTION_PLAN_STATUS_COLORS.get(status_name, "black"))
+
+        vsb = ttk.Scrollbar(top_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(top_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        bottom_frame = ttk.LabelFrame(main, text="计划历史", padding=6)
+        main.add(bottom_frame, weight=1)
+
+        hist_cols = ("time", "action", "change", "operator", "remark")
+        self.hist_tree = ttk.Treeview(bottom_frame, columns=hist_cols, show="headings", height=6)
+        hist_config = [("time", "时间", 140), ("action", "操作", 100),
+                        ("change", "状态变更", 120), ("operator", "操作人", 80),
+                        ("remark", "备注", 400)]
+        for cid, cname, cw in hist_config:
+            self.hist_tree.heading(cid, text=cname, anchor="center")
+            self.hist_tree.column(cid, width=cw, minwidth=40, anchor="w")
+
+        hvsb = ttk.Scrollbar(bottom_frame, orient="vertical", command=self.hist_tree.yview)
+        self.hist_tree.configure(yscrollcommand=hvsb.set)
+
+        self.hist_tree.pack(side="left", fill="both", expand=True)
+        hvsb.pack(side="right", fill="y")
+
+    def _build_status_bar(self):
+        self.status_bar = ttk.Label(self, text="", relief="sunken", anchor="w", padding=(8, 2))
+        self.status_bar.pack(fill="x", side="bottom")
+
+    def _refresh_table(self):
+        self.tree.delete(*self.tree.get_children())
+        plans = self.service.get_inspection_plans(**self._current_filters)
+        for p in plans:
+            vals = [p.get(c, "") for c, _, _ in INSPECTION_PLAN_TABLE_COLUMNS]
+            self.tree.insert("", "end", iid=str(p["id"]), values=vals, tags=(p["status"],))
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        plans = self.service.get_inspection_plans(**self._current_filters)
+        total = len(plans)
+        pending = sum(1 for p in plans if p["status"] == INSPECTION_PLAN_STATUS_PENDING)
+        completed = sum(1 for p in plans if p["status"] == INSPECTION_PLAN_STATUS_COMPLETED)
+        cancelled = sum(1 for p in plans if p["status"] == INSPECTION_PLAN_STATUS_CANCELLED)
+        self.status_bar.config(
+            text=f"共 {total} 条 | 待巡检: {pending} | 已完成: {completed} | 已取消: {cancelled}"
+        )
+
+    def _on_filter(self):
+        status = self.filter_status.get().strip() or None
+        executor = self.filter_executor.get().strip() or None
+        planner = self.filter_planner.get().strip() or None
+        date_start = self.filter_date_start.get().strip() or None
+        date_end = self.filter_date_end.get().strip() or None
+
+        if date_start:
+            try:
+                date.fromisoformat(date_start)
+            except ValueError:
+                messagebox.showerror("错误", "计划起始日期格式应为 YYYY-MM-DD")
+                return
+        if date_end:
+            try:
+                date.fromisoformat(date_end)
+            except ValueError:
+                messagebox.showerror("错误", "计划结束日期格式应为 YYYY-MM-DD")
+                return
+
+        self._current_filters = {
+            "status": status,
+            "executor": executor,
+            "planner": planner,
+            "date_start": date_start,
+            "date_end": date_end,
+        }
+        self._refresh_table()
+
+    def _on_reset_filter(self):
+        self._current_filters = {}
+        self.filter_status.set("")
+        self.filter_executor.set("")
+        self.filter_planner.set("")
+        self.filter_date_start.delete(0, "end")
+        self.filter_date_end.delete(0, "end")
+        self._refresh_table()
+
+    def _on_select(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            self._selected_plan_id = None
+            self.hist_tree.delete(*self.hist_tree.get_children())
+            return
+        plan_id = int(sel[0])
+        self._selected_plan_id = plan_id
+        self._refresh_history(plan_id)
+
+    def _refresh_history(self, plan_id):
+        self.hist_tree.delete(*self.hist_tree.get_children())
+        records = self.service.get_inspection_plan_history(plan_id)
+        for r in records:
+            change = f"{r['from_status']} → {r['to_status']}" if r['from_status'] else f"→ {r['to_status']}"
+            self.hist_tree.insert("", "end", values=(
+                r["created_at"], r["action"], change, r["operator"], r["remark"]
+            ))
+
+    def _get_selected_plan(self):
+        if not self._selected_plan_id:
+            return None
+        return self.service.get_inspection_plan(self._selected_plan_id)
+
+    def _on_add_plan(self):
+        fields = [
+            ("fixture_no", "灯具编号", ""),
+            ("plan_date", "计划日期", date.today().isoformat()),
+            ("planner", "计划人", ""),
+            ("executor", "执行人", ""),
+        ]
+        dlg = FormDialog(self, "新增巡检计划", fields, width=380)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r["fixture_no"]:
+            messagebox.showerror("错误", "灯具编号不能为空")
+            return
+        if not r["planner"]:
+            messagebox.showerror("错误", "计划人不能为空")
+            return
+        try:
+            self.service.add_inspection_plan(r["fixture_no"], r["plan_date"], r["planner"], r.get("executor", ""))
+            self._refresh_table()
+            messagebox.showinfo("成功", "巡检计划创建成功")
+        except ValueError as e:
+            messagebox.showerror("创建失败", str(e))
+
+    def _on_batch_generate(self):
+        fields = [
+            ("date_start", "开始日期", date.today().isoformat()),
+            ("date_end", "结束日期", (date.today() + timedelta(days=7)).isoformat()),
+            ("planner", "计划人", ""),
+            ("status_filter", "灯具状态筛选", ""),
+            ("location_filter", "库位筛选", ""),
+            ("person_filter", "负责人筛选", ""),
+        ]
+        dlg = FormDialog(self, "批量生成巡检计划", fields, width=400)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r["planner"]:
+            messagebox.showerror("错误", "计划人不能为空")
+            return
+        try:
+            result = self.service.batch_generate_inspection_plans(
+                r["date_start"], r["date_end"], r["planner"],
+                status_filter=r.get("status_filter") or None,
+                location_filter=r.get("location_filter") or None,
+                person_in_charge_filter=r.get("person_filter") or None,
+            )
+            self._refresh_table()
+            msg = f"成功生成 {result['created']} 条巡检计划\n共 {result['total_fixtures']} 个灯具符合条件"
+            if result["conflicts"]:
+                conflict_details = "\n".join(
+                    f"  {c['fixture_no']} ({c['plan_date']}): {c['reason']}"
+                    for c in result["conflicts"]
+                )
+                msg += f"\n\n跳过 {len(result['conflicts'])} 条冲突:\n{conflict_details}"
+            messagebox.showinfo("批量生成完成", msg)
+        except ValueError as e:
+            messagebox.showerror("生成失败", str(e))
+
+    def _on_complete(self):
+        plan = self._get_selected_plan()
+        if not plan:
+            messagebox.showwarning("提示", "请先选择一条巡检计划")
+            return
+        if plan["status"] == INSPECTION_PLAN_STATUS_COMPLETED:
+            messagebox.showwarning("提示", "该计划已完成")
+            return
+        if plan["status"] == INSPECTION_PLAN_STATUS_CANCELLED:
+            messagebox.showwarning("提示", "该计划已取消，无法标记完成")
+            return
+
+        fields = [
+            ("operator", "操作人", ""),
+            ("result", "处理结果", INSPECTION_PLAN_RESULT_PASS),
+            ("remark", "完成备注", ""),
+        ]
+        dlg = FormDialog(self, "标记完成", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r["operator"]:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+        try:
+            self.service.complete_inspection_plan(plan["id"], r["operator"], r["result"], r.get("remark", ""))
+            self._refresh_table()
+            self._refresh_history(plan["id"])
+            messagebox.showinfo("成功", "已标记为完成")
+        except ValueError as e:
+            messagebox.showerror("操作失败", str(e))
+
+    def _on_revert(self):
+        plan = self._get_selected_plan()
+        if not plan:
+            messagebox.showwarning("提示", "请先选择一条巡检计划")
+            return
+        if plan["status"] != INSPECTION_PLAN_STATUS_COMPLETED:
+            messagebox.showwarning("提示", "只有已完成的计划才能撤回")
+            return
+
+        fields = [
+            ("operator", "操作人", ""),
+            ("reason", "撤回原因", ""),
+        ]
+        dlg = FormDialog(self, "撤回完成", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r["operator"]:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+        if not messagebox.askyesno("确认撤回", "确定要撤回该计划的完成状态吗？"):
+            return
+        try:
+            self.service.revert_inspection_plan(plan["id"], r["operator"], r.get("reason", ""))
+            self._refresh_table()
+            self._refresh_history(plan["id"])
+            messagebox.showinfo("成功", "已撤回完成状态")
+        except ValueError as e:
+            messagebox.showerror("撤回失败", str(e))
+
+    def _on_cancel(self):
+        plan = self._get_selected_plan()
+        if not plan:
+            messagebox.showwarning("提示", "请先选择一条巡检计划")
+            return
+        if plan["status"] == INSPECTION_PLAN_STATUS_CANCELLED:
+            messagebox.showwarning("提示", "该计划已取消")
+            return
+        if plan["status"] == INSPECTION_PLAN_STATUS_COMPLETED:
+            messagebox.showwarning("提示", "已完成的计划不能取消，请先撤回完成")
+            return
+
+        fields = [
+            ("operator", "操作人", ""),
+            ("reason", "取消原因", ""),
+        ]
+        dlg = FormDialog(self, "取消计划", fields, width=360)
+        if dlg.result is None:
+            return
+        r = dlg.result
+        if not r["operator"]:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+        if not messagebox.askyesno("确认取消", "确定要取消该巡检计划吗？"):
+            return
+        try:
+            self.service.cancel_inspection_plan(plan["id"], r["operator"], r.get("reason", ""))
+            self._refresh_table()
+            self._refresh_history(plan["id"])
+            messagebox.showinfo("成功", "计划已取消")
+        except ValueError as e:
+            messagebox.showerror("取消失败", str(e))
+
+    def _on_import(self):
+        filepath = filedialog.askopenfilename(
+            title="选择巡检计划文件",
+            filetypes=[("CSV 文件", "*.csv"), ("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            records = self.service.parse_inspection_plan_import_file(filepath)
+        except ValueError as e:
+            messagebox.showerror("解析失败", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("解析失败", f"读取文件时出错:\n{e}")
+            return
+
+        try:
+            precheck_results, summary = self.service.precheck_inspection_plan_import(records)
+        except Exception as e:
+            messagebox.showerror("预检失败", f"预检时出错:\n{e}")
+            return
+
+        dlg = InspectionPlanPrecheckDialog(self, filepath, precheck_results, summary)
+        if not dlg.result:
+            return
+
+        operator = dlg.result.get("operator", "").strip()
+        if not operator:
+            messagebox.showerror("错误", "操作人不能为空")
+            return
+
+        if summary["error"] > 0 and not messagebox.askyesno(
+            "存在错误",
+            f"共 {summary['total']} 条记录，其中 {summary['error']} 条有错误（含 {summary['conflict']} 条冲突）。\n\n是否仅导入无错误的 {summary['new']} 条？",
+        ):
+            return
+
+        try:
+            result = self.service.execute_inspection_plan_import(filepath, operator)
+            self._refresh_table()
+            messagebox.showinfo("导入成功", f"成功导入 {result['created']} 条巡检计划")
+        except ValueError as e:
+            messagebox.showerror("导入失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
+
+    def _on_export(self):
+        plans = self.service.get_inspection_plans(**self._current_filters)
+        if not plans:
+            messagebox.showwarning("提示", "当前筛选结果为空，无数据可导出")
+            return
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择导出目录")
+        if not directory:
+            return
+        filename = f"巡检计划_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            path = self.service.export_inspection_plans_csv(plans, directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("导出成功", f"CSV 已导出到:\n{path}\n共 {len(plans)} 条记录")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出时发生错误:\n{e}")
+
+    def _on_export_template(self):
+        export_dir = self.service.get_export_dir()
+        directory = filedialog.askdirectory(initialdir=export_dir, title="选择模板导出目录")
+        if not directory:
+            return
+        filename = "巡检计划导入模板.csv"
+        try:
+            path = self.service.export_inspection_plan_template(directory, filename)
+            self.service.set_export_dir(directory)
+            messagebox.showinfo("成功", f"模板已导出到:\n{path}")
+        except (PermissionError, FileNotFoundError) as e:
+            messagebox.showerror("导出失败", str(e))
+
+
+class InspectionPlanPrecheckDialog(tk.Toplevel):
+    def __init__(self, parent, filepath, precheck_results, summary):
+        super().__init__(parent)
+        self.title(f"巡检计划导入预检 - {Path(filepath).name}")
+        self.result = None
+        self.precheck_results = precheck_results
+        self.summary = summary
+        self.filepath = filepath
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
+
+        summary_frame = ttk.LabelFrame(main, text="预检汇总", padding=8)
+        summary_frame.pack(fill="x", pady=(0, 8))
+
+        sum_text = (
+            f"共 {summary['total']} 条记录\n"
+            f"  新增: {summary.get('new', 0)} 条    "
+            f"错误: {summary.get('error', 0)} 条    "
+            f"其中冲突: {summary.get('conflict', 0)} 条"
+        )
+        ttk.Label(summary_frame, text=sum_text, font=("Arial", 10, "bold")).pack(anchor="w")
+
+        cols = ("row", "fixture_no", "plan_date", "result", "detail")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", height=15)
+        self.tree.heading("row", text="行号", anchor="center")
+        self.tree.heading("fixture_no", text="灯具编号", anchor="center")
+        self.tree.heading("plan_date", text="计划日期", anchor="center")
+        self.tree.heading("result", text="结果", anchor="center")
+        self.tree.heading("detail", text="详情", anchor="w")
+        self.tree.column("row", width=60, anchor="center")
+        self.tree.column("fixture_no", width=100, anchor="center")
+        self.tree.column("plan_date", width=100, anchor="center")
+        self.tree.column("result", width=80, anchor="center")
+        self.tree.column("detail", width=380, anchor="w")
+
+        self.tree.tag_configure("新增", foreground="#1565c0")
+        self.tree.tag_configure("错误", foreground="#c62828")
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for r in precheck_results:
+            detail = "; ".join(r["errors"]) if r["errors"] else "可导入"
+            self.tree.insert("", "end", values=(
+                r["row"], r["fixture_no"], r["plan_date"], r["result"], detail
+            ), tags=(r["result"],))
+
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(btn_frame, text="操作人:").pack(side="left", padx=(0, 4))
+        self.operator_var = tk.StringVar()
+        ttk.Entry(btn_frame, textvariable=self.operator_var, width=16).pack(side="left", padx=(0, 12))
+
+        ttk.Button(btn_frame, text="取消", command=self._cancel, width=10).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="确认导入", command=self._ok, width=10).pack(side="right", padx=4)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.geometry("760x520")
+        self.wait_window()
+
+    def _ok(self):
+        self.result = {
+            "operator": self.operator_var.get().strip(),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class Application(tk.Tk):
     def __init__(self, service):
         super().__init__()
@@ -3293,6 +4379,10 @@ class Application(tk.Tk):
         action_menu.add_command(label="导入草稿批次...", command=self._on_draft_list)
         action_menu.add_command(label="导入批次历史...", command=self._on_batch_history)
         menubar.add_cascade(label="操作", menu=action_menu)
+
+        inspection_menu = tk.Menu(menubar, tearoff=0)
+        inspection_menu.add_command(label="巡检计划台账...", command=self._on_inspection_plans)
+        menubar.add_cascade(label="巡检", menu=inspection_menu)
 
         self.config(menu=menubar)
 
@@ -3959,6 +5049,11 @@ class Application(tk.Tk):
         elif dlg.result and dlg.result.get("action") == "export_errors":
             batch_id = dlg.result["batch_id"]
             self._do_export_batch_errors(batch_id)
+
+    def _on_inspection_plans(self):
+        dlg = InspectionPlanDialog(self, self.service)
+        self.wait_window(dlg)
+        self._refresh_table()
 
     def _do_rollback(self, batch_id):
         fields = [("operator", "操作人", "")]

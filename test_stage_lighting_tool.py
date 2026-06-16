@@ -20,6 +20,10 @@ from stage_lighting_tool import (
     RESULT_NEW, RESULT_UPDATE, RESULT_SKIP, RESULT_ERROR, EXPORT_HEADERS,
     CONFLICT_STATUS_PENDING, CONFLICT_STATUS_RESOLVED, CONFLICT_STATUS_DISCARDED,
     RESOLUTION_ACTION_NONE, RESOLUTION_ACTION_ORIGINAL, RESOLUTION_ACTION_REFRESH, RESOLUTION_ACTION_DISCARD,
+    INSPECTION_PLAN_STATUS_PENDING, INSPECTION_PLAN_STATUS_COMPLETED, INSPECTION_PLAN_STATUS_CANCELLED,
+    INSPECTION_PLAN_RESULT_PASS, INSPECTION_PLAN_RESULT_FAIL,
+    INSPECTION_PLAN_EXPORT_HEADERS,
+    InspectionPlanDialog,
 )
 
 TMP_DIR = None
@@ -2904,6 +2908,506 @@ def test_draft_recheck_preserves_resolved_discarded():
     print("  PASS test_draft_recheck_preserves_resolved_discarded")
 
 
+def test_inspection_plan_add_and_query():
+    """巡检计划：新增计划、查询、基本字段验证"""
+    svc, db = make_service()
+    svc.add_fixture("IP001", "PAR64", "灯钩x2", "A-01", "2027-12-31", "张三")
+
+    plan_id = svc.add_inspection_plan("IP001", "2027-01-15", "计划员A", "巡检员B")
+    assert plan_id > 0
+
+    plan = svc.get_inspection_plan(plan_id)
+    assert plan["fixture_no"] == "IP001"
+    assert plan["plan_date"] == "2027-01-15"
+    assert plan["planner"] == "计划员A"
+    assert plan["executor"] == "巡检员B"
+    assert plan["status"] == INSPECTION_PLAN_STATUS_PENDING
+    assert plan["result"] == ""
+    assert plan["model"] == "PAR64"
+
+    plans = svc.get_inspection_plans()
+    assert len(plans) == 1
+    assert plans[0]["fixture_no"] == "IP001"
+
+    db.close()
+    print("  PASS test_inspection_plan_add_and_query")
+
+
+def test_inspection_plan_duplicate_conflict():
+    """巡检计划：同一灯具同一天重复建任务应被拦截并提示冲突"""
+    svc, db = make_service()
+    svc.add_fixture("IP002", "LED200", "", "B-02", "2027-06-30", "李四")
+
+    svc.add_inspection_plan("IP002", "2027-03-10", "计划员A")
+
+    try:
+        svc.add_inspection_plan("IP002", "2027-03-10", "计划员B")
+        assert False, "同一灯具同一天应被拦截"
+    except ValueError as e:
+        assert "已有巡检计划" in str(e)
+        assert "请勿重复创建" in str(e)
+
+    plans = svc.get_inspection_plans()
+    assert len(plans) == 1
+    assert plans[0]["planner"] == "计划员A"
+
+    db.close()
+    print("  PASS test_inspection_plan_duplicate_conflict")
+
+
+def test_inspection_plan_complete_and_revert():
+    """巡检计划：标记完成、撤回完成，状态和历史记录正确"""
+    svc, db = make_service()
+    svc.add_fixture("IP003", "Spot 250", "", "C-03", "2027-01-01", "王五")
+
+    plan_id = svc.add_inspection_plan("IP003", "2027-02-20", "计划员A", "王五")
+
+    svc.complete_inspection_plan(plan_id, "巡检员C", INSPECTION_PLAN_RESULT_PASS, "外观完好，功能正常")
+
+    plan = svc.get_inspection_plan(plan_id)
+    assert plan["status"] == INSPECTION_PLAN_STATUS_COMPLETED
+    assert plan["result"] == INSPECTION_PLAN_RESULT_PASS
+    assert plan["completion_remark"] == "外观完好，功能正常"
+    assert plan["processed_at"] != ""
+
+    hist = svc.get_inspection_plan_history(plan_id)
+    assert len(hist) >= 2
+    actions = [h["action"] for h in hist]
+    assert "创建计划" in actions
+    assert "完成巡检" in actions
+
+    svc.revert_inspection_plan(plan_id, "管理员", "发现记录有误，撤回重检")
+
+    plan2 = svc.get_inspection_plan(plan_id)
+    assert plan2["status"] == INSPECTION_PLAN_STATUS_PENDING
+    assert plan2["result"] == ""
+    assert plan2["completion_remark"] == ""
+    assert plan2["processed_at"] == ""
+
+    hist2 = svc.get_inspection_plan_history(plan_id)
+    actions2 = [h["action"] for h in hist2]
+    assert "撤回完成" in actions2
+
+    revert_record = next(h for h in hist2 if h["action"] == "撤回完成")
+    assert "原结果: 通过" in revert_record["remark"]
+    assert "撤回原因: 发现记录有误" in revert_record["remark"]
+
+    db.close()
+    print("  PASS test_inspection_plan_complete_and_revert")
+
+
+def test_inspection_plan_cancel():
+    """巡检计划：取消计划，状态正确，已完成的不能取消"""
+    svc, db = make_service()
+    svc.add_fixture("IP004", "Flood 100", "", "D-04", "2027-09-01", "赵六")
+
+    plan_id = svc.add_inspection_plan("IP004", "2027-05-01", "计划员A")
+
+    svc.cancel_inspection_plan(plan_id, "管理员", "灯具已借出，延后巡检")
+
+    plan = svc.get_inspection_plan(plan_id)
+    assert plan["status"] == INSPECTION_PLAN_STATUS_CANCELLED
+
+    try:
+        svc.cancel_inspection_plan(plan_id, "管理员")
+        assert False, "已取消的计划不能重复取消"
+    except ValueError as e:
+        assert "已取消" in str(e)
+
+    try:
+        svc.complete_inspection_plan(plan_id, "巡检员", INSPECTION_PLAN_RESULT_PASS)
+        assert False, "已取消的计划不能标记完成"
+    except ValueError as e:
+        assert "已取消" in str(e)
+
+    plan_id2 = svc.add_inspection_plan("IP004", "2027-05-02", "计划员A")
+    svc.complete_inspection_plan(plan_id2, "巡检员", INSPECTION_PLAN_RESULT_PASS)
+    try:
+        svc.cancel_inspection_plan(plan_id2, "管理员")
+        assert False, "已完成的计划不能取消"
+    except ValueError as e:
+        assert "已完成" in str(e)
+
+    db.close()
+    print("  PASS test_inspection_plan_cancel")
+
+
+def test_inspection_plan_batch_generate():
+    """巡检计划：按日期范围批量生成待巡检任务"""
+    svc, db = make_service()
+    for i in range(5):
+        svc.add_fixture(f"BG{i:03d}", f"Model{i}", "", f"Loc{i}", "2027-12-31", f"Person{i}")
+
+    result = svc.batch_generate_inspection_plans(
+        "2027-06-01", "2027-06-05", "批量计划员"
+    )
+
+    assert result["created"] == 5
+    assert result["total_fixtures"] == 5
+    assert len(result["conflicts"]) == 0
+
+    plans = svc.get_inspection_plans()
+    assert len(plans) == 5
+    dates = {p["plan_date"] for p in plans}
+    assert len(dates) == 5
+    for d in dates:
+        assert "2027-06" in d
+
+    for p in plans:
+        assert p["status"] == INSPECTION_PLAN_STATUS_PENDING
+        assert p["planner"] == "批量计划员"
+
+    result2 = svc.batch_generate_inspection_plans(
+        "2027-06-01", "2027-06-05", "批量计划员"
+    )
+    assert result2["created"] == 0
+    assert len(result2["conflicts"]) == 5
+
+    db.close()
+    print("  PASS test_inspection_plan_batch_generate")
+
+
+def test_inspection_plan_batch_generate_with_filters():
+    """巡检计划：批量生成支持按状态、库位、负责人筛选"""
+    svc, db = make_service()
+    svc.add_fixture("FL001", "M1", "", "A-01", "2027-12-31", "张组")
+    svc.add_fixture("FL002", "M2", "", "A-02", "2027-12-31", "张组")
+    svc.add_fixture("FL003", "M3", "", "B-01", "2027-12-31", "李组")
+    fid_borrowed = svc.add_fixture("FL004", "M4", "", "B-02", "2027-12-31", "李组")
+    svc.borrow(fid_borrowed, "借用人", "演出借用")
+
+    result_all = svc.batch_generate_inspection_plans(
+        "2027-07-01", "2027-07-10", "计划员",
+        status_filter=STATUS_AVAILABLE
+    )
+    assert result_all["created"] == 3
+
+    result_loc_a = svc.batch_generate_inspection_plans(
+        "2027-08-01", "2027-08-10", "计划员",
+        location_filter="A-01",
+    )
+    assert result_loc_a["created"] == 1
+    plans_loc_a = svc.get_inspection_plans(date_start="2027-08-01", date_end="2027-08-31")
+    assert plans_loc_a[0]["fixture_no"] == "FL001"
+
+    result_person = svc.batch_generate_inspection_plans(
+        "2027-09-01", "2027-09-10", "计划员",
+        person_in_charge_filter="张组",
+    )
+    assert result_person["created"] == 2
+
+    db.close()
+    print("  PASS test_inspection_plan_batch_generate_with_filters")
+
+
+def test_inspection_plan_filter_by_status_executor_date():
+    """巡检计划：按负责人、日期、状态筛选"""
+    svc, db = make_service()
+    svc.add_fixture("FT001", "M1", "", "L1", "2027-12-31", "张三")
+    svc.add_fixture("FT002", "M2", "", "L2", "2027-12-31", "李四")
+    svc.add_fixture("FT003", "M3", "", "L3", "2027-12-31", "王五")
+
+    pid1 = svc.add_inspection_plan("FT001", "2027-03-01", "计划A", "张三")
+    pid2 = svc.add_inspection_plan("FT002", "2027-03-15", "计划A", "李四")
+    pid3 = svc.add_inspection_plan("FT003", "2027-04-01", "计划B", "王五")
+
+    svc.complete_inspection_plan(pid1, "张三", INSPECTION_PLAN_RESULT_PASS)
+    svc.complete_inspection_plan(pid2, "李四", INSPECTION_PLAN_RESULT_FAIL, "灯泡坏了")
+
+    pending = svc.get_inspection_plans(status=INSPECTION_PLAN_STATUS_PENDING)
+    assert len(pending) == 1
+    assert pending[0]["fixture_no"] == "FT003"
+
+    completed = svc.get_inspection_plans(status=INSPECTION_PLAN_STATUS_COMPLETED)
+    assert len(completed) == 2
+
+    executor_zhangsan = svc.get_inspection_plans(executor="张三")
+    assert len(executor_zhangsan) == 1
+    assert executor_zhangsan[0]["fixture_no"] == "FT001"
+
+    planner_a = svc.get_inspection_plans(planner="计划A")
+    assert len(planner_a) == 2
+
+    march = svc.get_inspection_plans(date_start="2027-03-01", date_end="2027-03-31")
+    assert len(march) == 2
+
+    db.close()
+    print("  PASS test_inspection_plan_filter_by_status_executor_date")
+
+
+def test_inspection_plan_csv_export_import():
+    """巡检计划：CSV导出执行结果和CSV导入待巡检任务"""
+    svc, db = make_service()
+    svc.add_fixture("CE001", "ModelA", "acc1", "Loc1", "2027-12-31", "张一")
+    svc.add_fixture("CE002", "ModelB", "acc2", "Loc2", "2027-12-31", "李二")
+    svc.add_fixture("CE003", "ModelC", "", "Loc3", "2027-12-31", "王三")
+
+    pid1 = svc.add_inspection_plan("CE001", "2027-05-10", "计划员X", "张一")
+    pid2 = svc.add_inspection_plan("CE002", "2027-05-11", "计划员X", "李二")
+    svc.complete_inspection_plan(pid1, "张一", INSPECTION_PLAN_RESULT_PASS, "一切正常")
+
+    out_dir = Path(TMP_DIR) / "inspection_export"
+    out_dir.mkdir()
+    plans = svc.get_inspection_plans()
+    path = svc.export_inspection_plans_csv(plans, str(out_dir), "inspection_export.csv")
+
+    assert os.path.exists(path)
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        assert "灯具编号" in header
+        assert "处理结果" in header
+        assert "完成备注" in header
+        rows = list(reader)
+        assert len(rows) == 2
+
+    import_dir = Path(TMP_DIR) / "inspection_import"
+    import_dir.mkdir()
+    import_rows = [
+        INSPECTION_PLAN_EXPORT_HEADERS,
+        ["CE003", "ModelC", "2027-06-01", "导入计划员", "王三", "待巡检", "", "", ""],
+        ["CE001", "ModelA", "2027-06-02", "导入计划员", "张一", "待巡检", "", "", ""],
+    ]
+    import_path = import_dir / "import_plans.csv"
+    with open(import_path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerows(import_rows)
+
+    result = svc.execute_inspection_plan_import(str(import_path), "导入操作员")
+    assert result["created"] == 2
+
+    all_plans = svc.get_inspection_plans()
+    assert len(all_plans) == 4
+
+    june_plans = svc.get_inspection_plans(date_start="2027-06-01", date_end="2027-06-30")
+    assert len(june_plans) == 2
+
+    db.close()
+    print("  PASS test_inspection_plan_csv_export_import")
+
+
+def test_inspection_plan_import_conflict_detection():
+    """巡检计划：导入时同一灯具同一天重复建任务被拦住并提示冲突"""
+    svc, db = make_service()
+    svc.add_fixture("CD001", "M1", "", "L1", "2027-12-31", "张一")
+    svc.add_fixture("CD002", "M2", "", "L2", "2027-12-31", "李二")
+
+    svc.add_inspection_plan("CD001", "2027-07-01", "原有计划员")
+
+    import_dir = Path(TMP_DIR) / "inspection_conflict"
+    import_dir.mkdir()
+    import_rows = [
+        INSPECTION_PLAN_EXPORT_HEADERS,
+        ["CD001", "M1", "2027-07-01", "新计划员", "张一", "待巡检", "", "", ""],
+        ["CD002", "M2", "2027-07-01", "新计划员", "李二", "待巡检", "", "", ""],
+    ]
+    import_path = import_dir / "conflict_plans.csv"
+    with open(import_path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerows(import_rows)
+
+    records = svc.parse_inspection_plan_import_file(str(import_path))
+    precheck_results, summary = svc.precheck_inspection_plan_import(records)
+
+    assert summary["total"] == 2
+    assert summary["new"] == 1
+    assert summary["error"] == 1
+    assert summary["conflict"] == 1
+
+    conflict_item = next(r for r in precheck_results if r["result"] == "错误")
+    assert conflict_item["fixture_no"] == "CD001"
+    assert any("已存在" in e for e in conflict_item["errors"])
+
+    try:
+        svc.execute_inspection_plan_import(str(import_path), "导入员")
+        assert False, "有冲突的导入应该被阻止"
+    except ValueError as e:
+        assert "错误" in str(e)
+        assert "冲突" in str(e)
+
+    all_plans = svc.get_inspection_plans()
+    assert len(all_plans) == 1
+
+    db.close()
+    print("  PASS test_inspection_plan_import_conflict_detection")
+
+
+def test_inspection_plan_persistence_cross_restart():
+    """巡检计划：数据持久化，关掉再打开还在"""
+    db_path = Path(TMP_DIR) / "inspection_persist.db"
+    db1 = DatabaseManager(db_path)
+    svc1 = LightingService(db1)
+
+    svc1.add_fixture("XP001", "ModelX", "", "LocX", "2027-12-31", "Persist")
+    pid = svc1.add_inspection_plan("XP001", "2027-08-15", "计划员P", "Persist")
+    svc1.complete_inspection_plan(pid, "Persist", INSPECTION_PLAN_RESULT_PASS, "持久化测试")
+
+    db1.close()
+
+    db2 = DatabaseManager(db_path)
+    svc2 = LightingService(db2)
+
+    plans = svc2.get_inspection_plans()
+    assert len(plans) == 1
+    assert plans[0]["fixture_no"] == "XP001"
+    assert plans[0]["status"] == INSPECTION_PLAN_STATUS_COMPLETED
+    assert plans[0]["result"] == INSPECTION_PLAN_RESULT_PASS
+
+    hist = svc2.get_inspection_plan_history(plans[0]["id"])
+    assert len(hist) >= 2
+
+    db2.close()
+    print("  PASS test_inspection_plan_persistence_cross_restart")
+
+
+def test_existing_lending_not_broken_by_inspection_plan():
+    """回归测试：新增巡检计划模块不影响现有借出、归还、冻结和批量导入"""
+    svc, db = make_service()
+
+    fid = svc.add_fixture("RT001", "RegressionModel", "acc", "R-01", "2027-12-31", "回归测试员")
+
+    svc.borrow(fid, "借用人", "回归测试借用")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_BORROWED
+
+    svc.return_fixture(fid, "归还人", "回归测试归还")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_RETURN_PENDING
+
+    svc.review_return(fid, "复核人", "回归测试复核")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_AVAILABLE
+
+    svc.freeze_inspection(fid, "冻结人", "回归测试巡检冻结")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_INSPECTION_FREEZE
+
+    svc.unfreeze_inspection(fid, "回归测试员", "2028-01-01", "回归测试解冻")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_AVAILABLE
+
+    svc.freeze_maintenance(fid, "冻结人", "回归测试维修冻结")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_MAINTENANCE_FREEZE
+
+    svc.unfreeze_maintenance(fid, "回归测试员", "回归测试维修解冻")
+    f = db.get_fixture(fid)
+    assert f["status"] == STATUS_AVAILABLE
+
+    import_dir = Path(TMP_DIR) / "regression_import"
+    import_dir.mkdir()
+    import_rows = [
+        EXPORT_HEADERS,
+        ["RT002", "NewModel", "", "R-02", "2027-12-31", "新人", "可用", ""],
+    ]
+    import_path = import_dir / "regression_import.csv"
+    with open(import_path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerows(import_rows)
+
+    import_result = svc.execute_import(str(import_path), "导入员")
+    assert import_result["summary"]["new"] == 1
+
+    plan_id = svc.add_inspection_plan("RT002", "2027-09-01", "计划员")
+    svc.complete_inspection_plan(plan_id, "巡检员", INSPECTION_PLAN_RESULT_PASS)
+
+    f_after = db.get_fixture_by_no("RT001")
+    assert f_after["status"] == STATUS_AVAILABLE
+    assert f_after["inspection_due_date"] == "2028-01-01"
+
+    db.close()
+    print("  PASS test_existing_lending_not_broken_by_inspection_plan")
+
+
+def test_inspection_plan_invalid_inputs():
+    """巡检计划：各种非法输入的边界校验"""
+    svc, db = make_service()
+    svc.add_fixture("IV001", "M1", "", "L1", "2027-12-31", "张三")
+
+    try:
+        svc.add_inspection_plan("", "2027-01-01", "计划员")
+        assert False, "空灯具编号应该报错"
+    except ValueError as e:
+        assert "灯具编号不能为空" in str(e)
+
+    try:
+        svc.add_inspection_plan("IV001", "", "计划员")
+        assert False, "空日期应该报错"
+    except ValueError as e:
+        assert "计划日期不能为空" in str(e)
+
+    try:
+        svc.add_inspection_plan("IV001", "2027-13-01", "计划员")
+        assert False, "非法日期应该报错"
+    except ValueError as e:
+        assert "格式应为 YYYY-MM-DD" in str(e)
+
+    try:
+        svc.add_inspection_plan("IV001", "2027-01-01", "")
+        assert False, "空计划人应该报错"
+    except ValueError as e:
+        assert "计划人不能为空" in str(e)
+
+    try:
+        svc.add_inspection_plan("NOT_EXIST", "2027-01-01", "计划员")
+        assert False, "不存在的灯具应该报错"
+    except ValueError as e:
+        assert "不存在" in str(e)
+
+    plan_id = svc.add_inspection_plan("IV001", "2027-01-01", "计划员")
+    try:
+        svc.complete_inspection_plan(plan_id, "", INSPECTION_PLAN_RESULT_PASS)
+        assert False, "空操作人应该报错"
+    except ValueError as e:
+        assert "操作人不能为空" in str(e)
+
+    try:
+        svc.complete_inspection_plan(plan_id, "巡检员", "无效结果")
+        assert False, "无效处理结果应该报错"
+    except ValueError as e:
+        assert "处理结果必须是" in str(e)
+
+    db.close()
+    print("  PASS test_inspection_plan_invalid_inputs")
+
+
+def test_gui_inspection_plan_dialog_opens():
+    """GUI回归：巡检计划对话框能正常打开且不崩溃"""
+    import tkinter as tk
+    from tkinter import ttk
+
+    svc, db = make_service()
+    svc.add_fixture("GUI001", "GUIModel", "", "G-01", "2027-12-31", "GUI测试员")
+    svc.add_inspection_plan("GUI001", "2027-06-01", "GUI计划员", "GUI测试员")
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        dlg = InspectionPlanDialog(root, svc)
+        dlg.update()
+
+        assert dlg.title() == "巡检计划台账"
+
+        tree_children = dlg.tree.get_children()
+        assert len(tree_children) > 0
+
+        first_item = dlg.tree.item(tree_children[0])
+        assert first_item["values"][1] == "GUI001"
+
+        dlg.filter_status.set(INSPECTION_PLAN_STATUS_PENDING)
+        dlg._on_filter()
+        dlg.update()
+
+        dlg.destroy()
+        root.update()
+    finally:
+        root.destroy()
+        db.close()
+
+    print("  PASS test_gui_inspection_plan_dialog_opens")
+
+
 def main():
     setup()
     tests = [
@@ -2987,6 +3491,19 @@ def main():
         test_draft_conflict_unresolved_blocks_submit,
         test_draft_conflict_export_and_log_consistency,
         test_draft_recheck_preserves_resolved_discarded,
+        test_inspection_plan_add_and_query,
+        test_inspection_plan_duplicate_conflict,
+        test_inspection_plan_complete_and_revert,
+        test_inspection_plan_cancel,
+        test_inspection_plan_batch_generate,
+        test_inspection_plan_batch_generate_with_filters,
+        test_inspection_plan_filter_by_status_executor_date,
+        test_inspection_plan_csv_export_import,
+        test_inspection_plan_import_conflict_detection,
+        test_inspection_plan_persistence_cross_restart,
+        test_existing_lending_not_broken_by_inspection_plan,
+        test_inspection_plan_invalid_inputs,
+        test_gui_inspection_plan_dialog_opens,
     ]
     passed = 0
     failed = 0

@@ -98,6 +98,52 @@ RESOLUTION_ACTION_DISCARD = "discard"
 
 ROLLBACK_SAFE_STATUSES = {STATUS_AVAILABLE}
 
+DRAFT_STATUS_DRAFT = "draft"
+DRAFT_STATUS_SUBMITTED = "submitted"
+DRAFT_STATUS_DELETED = "deleted"
+DRAFT_STATUS_PARTIAL = "partial"
+DRAFT_STATUS_CONFLICT_SUBMITTED = "conflict_submitted"
+
+DRAFT_ALL_STATUSES = [
+    DRAFT_STATUS_DRAFT,
+    DRAFT_STATUS_PARTIAL,
+    DRAFT_STATUS_CONFLICT_SUBMITTED,
+    DRAFT_STATUS_SUBMITTED,
+    DRAFT_STATUS_DELETED,
+]
+
+DRAFT_STATUS_DISPLAY = {
+    DRAFT_STATUS_DRAFT: "草稿中",
+    DRAFT_STATUS_PARTIAL: "部分提交",
+    DRAFT_STATUS_CONFLICT_SUBMITTED: "冲突后提交",
+    DRAFT_STATUS_SUBMITTED: "已提交",
+    DRAFT_STATUS_DELETED: "已删除",
+}
+
+DRAFT_OPERATION_CREATE = "创建草稿"
+DRAFT_OPERATION_ASSIGN = "分派"
+DRAFT_OPERATION_TAKEOVER = "接手"
+DRAFT_OPERATION_WITHDRAW_TAKEOVER = "撤回接手"
+DRAFT_OPERATION_RELEASE = "释放责任"
+DRAFT_OPERATION_SUBMIT = "提交"
+DRAFT_OPERATION_PARTIAL_SUBMIT = "部分提交"
+DRAFT_OPERATION_EXPORT = "导出"
+DRAFT_OPERATION_EDIT_REMARK = "编辑备注"
+DRAFT_OPERATION_DELETE = "删除草稿"
+DRAFT_OPERATION_CONFLICT_RESOLVE = "冲突处理"
+
+HANDOVER_TYPE_ASSIGN = "assign"
+HANDOVER_TYPE_TAKEOVER = "takeover"
+HANDOVER_TYPE_WITHDRAW = "withdraw"
+HANDOVER_TYPE_RELEASE = "release"
+
+DRAFT_PERM_CREATE = "create"
+DRAFT_PERM_EDIT = "edit"
+DRAFT_PERM_ASSIGN = "assign"
+DRAFT_PERM_SUBMIT = "submit"
+DRAFT_PERM_WITHDRAW = "withdraw"
+DRAFT_PERM_READONLY = "readonly"
+
 INSPECTION_PLAN_STATUS_PENDING = "待巡检"
 INSPECTION_PLAN_STATUS_COMPLETED = "已完成"
 INSPECTION_PLAN_STATUS_CANCELLED = "已取消"
@@ -353,6 +399,23 @@ class DatabaseManager:
                 skip_count INTEGER NOT NULL DEFAULT 0,
                 error_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'draft',
+                current_operator TEXT NOT NULL DEFAULT '',
+                handover_reason TEXT NOT NULL DEFAULT '',
+                handover_at TEXT NOT NULL DEFAULT '',
+                assigned_by TEXT NOT NULL DEFAULT '',
+                assigned_at TEXT NOT NULL DEFAULT '',
+                assigned_to TEXT NOT NULL DEFAULT '',
+                assign_reason TEXT NOT NULL DEFAULT '',
+                last_operation TEXT NOT NULL DEFAULT '',
+                last_operation_at TEXT NOT NULL DEFAULT '',
+                last_operation_by TEXT NOT NULL DEFAULT '',
+                last_operation_detail TEXT NOT NULL DEFAULT '',
+                last_export_at TEXT NOT NULL DEFAULT '',
+                last_export_by TEXT NOT NULL DEFAULT '',
+                exported_before_submit INTEGER NOT NULL DEFAULT 0,
+                processing_started_at TEXT NOT NULL DEFAULT '',
+                processing_completed_at TEXT NOT NULL DEFAULT '',
+                submit_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             );
@@ -374,6 +437,9 @@ class DatabaseManager:
                 resolution_note TEXT NOT NULL DEFAULT '',
                 current_db_snapshot TEXT NOT NULL DEFAULT '',
                 resolved_at TEXT NOT NULL DEFAULT '',
+                resolved_by TEXT NOT NULL DEFAULT '',
+                submitted INTEGER NOT NULL DEFAULT 0,
+                submitted_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
             );
@@ -385,18 +451,40 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_batch_items(batch_id);
             CREATE INDEX IF NOT EXISTS idx_import_items_fno ON import_batch_items(fixture_no);
             CREATE INDEX IF NOT EXISTS idx_import_draft_no ON import_draft_batches(draft_no);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_operator ON import_draft_batches(current_operator);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_creator ON import_draft_batches(operator);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_status ON import_draft_batches(status);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_created ON import_draft_batches(created_at);
             CREATE INDEX IF NOT EXISTS idx_import_draft_items_draft ON import_draft_items(draft_id);
             CREATE INDEX IF NOT EXISTS idx_import_draft_items_fno ON import_draft_items(fixture_no);
+            CREATE INDEX IF NOT EXISTS idx_import_draft_items_conflict ON import_draft_items(conflict_status);
             CREATE TABLE IF NOT EXISTS draft_handover_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 draft_id INTEGER NOT NULL,
+                handover_type TEXT NOT NULL DEFAULT 'takeover',
                 from_operator TEXT NOT NULL DEFAULT '',
                 to_operator TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_draft_handover_draft ON draft_handover_log(draft_id);
+            CREATE TABLE IF NOT EXISTS draft_operation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id INTEGER NOT NULL,
+                operation TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                before_status TEXT NOT NULL DEFAULT '',
+                after_status TEXT NOT NULL DEFAULT '',
+                affected_items INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (draft_id) REFERENCES import_draft_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_draft_operation_draft ON draft_operation_log(draft_id);
+            CREATE INDEX IF NOT EXISTS idx_draft_operation_op ON draft_operation_log(operation);
+            CREATE INDEX IF NOT EXISTS idx_draft_operation_time ON draft_operation_log(created_at);
             CREATE TABLE IF NOT EXISTS inspection_plans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fixture_id INTEGER NOT NULL,
@@ -533,6 +621,47 @@ class DatabaseManager:
             pass
         try:
             self.conn.execute("ALTER TABLE import_draft_items ADD COLUMN resolved_at TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        for col, coltype in [
+            ("assigned_by", "TEXT NOT NULL DEFAULT ''"),
+            ("assigned_at", "TEXT NOT NULL DEFAULT ''"),
+            ("assigned_to", "TEXT NOT NULL DEFAULT ''"),
+            ("assign_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("last_operation", "TEXT NOT NULL DEFAULT ''"),
+            ("last_operation_at", "TEXT NOT NULL DEFAULT ''"),
+            ("last_operation_by", "TEXT NOT NULL DEFAULT ''"),
+            ("last_operation_detail", "TEXT NOT NULL DEFAULT ''"),
+            ("last_export_at", "TEXT NOT NULL DEFAULT ''"),
+            ("last_export_by", "TEXT NOT NULL DEFAULT ''"),
+            ("exported_before_submit", "INTEGER NOT NULL DEFAULT 0"),
+            ("processing_started_at", "TEXT NOT NULL DEFAULT ''"),
+            ("processing_completed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("submit_count", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE import_draft_batches ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+        for col, coltype in [
+            ("resolved_by", "TEXT NOT NULL DEFAULT ''"),
+            ("submitted", "INTEGER NOT NULL DEFAULT 0"),
+            ("submitted_at", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE import_draft_items ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+        for col, coltype in [
+            ("handover_type", "TEXT NOT NULL DEFAULT 'takeover'"),
+            ("operator", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE draft_handover_log ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+        try:
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_draft_handover_type ON draft_handover_log(handover_type)")
         except Exception:
             pass
         self.conn.commit()
@@ -703,7 +832,7 @@ class DatabaseManager:
         self.commit()
 
     def get_draft_batches(self):
-        rows = self.execute("SELECT * FROM import_draft_batches WHERE status='draft' ORDER BY updated_at DESC").fetchall()
+        rows = self.execute("SELECT * FROM import_draft_batches WHERE status NOT IN ('deleted') ORDER BY updated_at DESC").fetchall()
         return [dict(r) for r in rows]
 
     def get_draft_batch(self, draft_id):
@@ -819,15 +948,21 @@ class DatabaseManager:
         )
         self.commit()
 
-    def add_draft_handover(self, draft_id, from_operator, to_operator, reason):
+    def add_draft_handover(self, draft_id, from_operator, to_operator, reason, handover_type=HANDOVER_TYPE_TAKEOVER, operator=""):
         self.execute(
-            "INSERT INTO draft_handover_log (draft_id, from_operator, to_operator, reason) VALUES (?,?,?,?)",
-            (draft_id, from_operator or "", to_operator, reason or ""),
+            "INSERT INTO draft_handover_log (draft_id, handover_type, from_operator, to_operator, reason, operator) VALUES (?,?,?,?,?,?)",
+            (draft_id, handover_type, from_operator or "", to_operator or "", reason or "", operator or ""),
         )
-        self.execute(
-            "UPDATE import_draft_batches SET current_operator=?, handover_reason=?, handover_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?",
-            (to_operator, reason or "", draft_id),
-        )
+        if handover_type in (HANDOVER_TYPE_ASSIGN, HANDOVER_TYPE_TAKEOVER):
+            self.execute(
+                "UPDATE import_draft_batches SET current_operator=?, handover_reason=?, handover_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?",
+                (to_operator or "", reason or "", draft_id),
+            )
+        elif handover_type in (HANDOVER_TYPE_WITHDRAW, HANDOVER_TYPE_RELEASE):
+            self.execute(
+                "UPDATE import_draft_batches SET current_operator=?, handover_reason=?, handover_at='', updated_at=datetime('now','localtime') WHERE id=?",
+                (to_operator or "", reason or "", draft_id),
+            )
         self.commit()
 
     def get_draft_handover_log(self, draft_id):
@@ -835,7 +970,7 @@ class DatabaseManager:
             "SELECT * FROM draft_handover_log WHERE draft_id=? ORDER BY created_at",
             (draft_id,),
         ).fetchall()
-        return rows
+        return [dict(r) for r in rows]
 
     def get_draft_current_operator(self, draft_id):
         row = self.execute(
@@ -845,6 +980,118 @@ class DatabaseManager:
         if not row:
             return None
         return row["current_operator"] or row["operator"]
+
+    def set_draft_last_operation(self, draft_id, operation, operator="", detail="", before_status="", after_status="", affected_items=0):
+        self.execute(
+            "UPDATE import_draft_batches SET last_operation=?, last_operation_at=datetime('now','localtime'), last_operation_by=?, last_operation_detail=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (operation or "", operator or "", detail or "", draft_id),
+        )
+        self.execute(
+            "INSERT INTO draft_operation_log (draft_id, operation, operator, detail, before_status, after_status, affected_items) VALUES (?,?,?,?,?,?,?)",
+            (draft_id, operation or "", operator or "", detail or "", before_status or "", after_status or "", affected_items),
+        )
+        self.commit()
+
+    def get_draft_operation_log(self, draft_id):
+        rows = self.execute(
+            "SELECT * FROM draft_operation_log WHERE draft_id=? ORDER BY created_at",
+            (draft_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_draft_export_record(self, draft_id, operator=""):
+        self.execute(
+            "UPDATE import_draft_batches SET last_export_at=datetime('now','localtime'), last_export_by=?, exported_before_submit=1, updated_at=datetime('now','localtime') WHERE id=?",
+            (operator or "", draft_id),
+        )
+        self.commit()
+
+    def increment_draft_submit_count(self, draft_id, new_status="submitted", completed=False):
+        updates = ["submit_count = submit_count + 1"]
+        params = []
+        if completed:
+            updates.append("processing_completed_at=datetime('now','localtime')")
+            updates.append("status=?")
+            params.append(new_status)
+        params.append(draft_id)
+        sql = f"UPDATE import_draft_batches SET {', '.join(updates)}, updated_at=datetime('now','localtime') WHERE id=?"
+        self.execute(sql, params)
+        self.commit()
+
+    def set_draft_items_submitted(self, draft_id, item_ids):
+        if not item_ids:
+            return
+        placeholders = ",".join("?" * len(item_ids))
+        self.execute(
+            f"UPDATE import_draft_items SET submitted=1, submitted_at=datetime('now','localtime') WHERE draft_id=? AND id IN ({placeholders})",
+            [draft_id] + list(item_ids),
+        )
+        self.commit()
+
+    def set_draft_item_resolved_by(self, item_id, operator=""):
+        self.execute(
+            "UPDATE import_draft_items SET resolved_by=? WHERE id=?",
+            (operator or "", item_id),
+        )
+        self.commit()
+
+    def query_draft_batches(self, operator=None, current_operator=None, status=None,
+                            date_start=None, date_end=None, conflict_status=None,
+                            creator=None, source_file=None):
+        sql = "SELECT * FROM import_draft_batches WHERE 1=1"
+        params = []
+        if operator:
+            sql += " AND operator=?"
+            params.append(operator)
+        if creator:
+            sql += " AND operator=?"
+            params.append(creator)
+        if current_operator:
+            sql += " AND current_operator=?"
+            params.append(current_operator)
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        if date_start:
+            sql += " AND date(created_at)>=date(?)"
+            params.append(date_start)
+        if date_end:
+            sql += " AND date(created_at)<=date(?)"
+            params.append(date_end)
+        if source_file:
+            sql += " AND source_file LIKE ?"
+            params.append(f"%{source_file}%")
+        if conflict_status:
+            sub = f"SELECT DISTINCT draft_id FROM import_draft_items WHERE conflict_status=?"
+            sql += f" AND id IN ({sub})"
+            params.append(conflict_status)
+        sql += " ORDER BY created_at DESC"
+        return [dict(r) for r in self.execute(sql, params).fetchall()]
+
+    def get_all_draft_operators(self):
+        rows = self.execute(
+            "SELECT DISTINCT current_operator AS op FROM import_draft_batches WHERE current_operator!='' "
+            "UNION SELECT DISTINCT operator FROM import_draft_batches WHERE operator!='' "
+            "ORDER BY op"
+        ).fetchall()
+        return [r["op"] for r in rows]
+
+    def get_all_draft_source_files(self):
+        rows = self.execute(
+            "SELECT DISTINCT source_file FROM import_draft_batches WHERE source_file!='' ORDER BY source_file"
+        ).fetchall()
+        return [r["source_file"] for r in rows]
+
+    def get_draft_conflicts_summary_full(self, draft_id):
+        rows = self.execute(
+            "SELECT conflict_status, COUNT(*) AS cnt FROM import_draft_items WHERE draft_id=? GROUP BY conflict_status",
+            (draft_id,),
+        ).fetchall()
+        result = {CONFLICT_STATUS_NONE: 0, CONFLICT_STATUS_PENDING: 0,
+                  CONFLICT_STATUS_RESOLVED: 0, CONFLICT_STATUS_DISCARDED: 0}
+        for r in rows:
+            result[r["conflict_status"] or CONFLICT_STATUS_NONE] = r["cnt"]
+        return result
 
     def begin_transaction(self):
         self.execute("BEGIN IMMEDIATE")
@@ -1850,6 +2097,9 @@ class LightingService:
                 )
 
             self.db.update_draft_batch(draft_id, current_operator=operator)
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_CREATE, operator,
+                                             f"从{source_name}导入创建，共{summary['total']}条记录",
+                                             "", DRAFT_STATUS_DRAFT, summary["total"])
             self.db.commit()
             return {"draft_id": draft_id, "draft_no": draft_no}
         except Exception:
@@ -1876,19 +2126,199 @@ class LightingService:
         draft = self.db.get_draft_batch(draft_id)
         if not draft:
             raise ValueError("草稿批次不存在")
-        if draft["status"] != "draft":
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
             raise ValueError(f"草稿状态为「{draft['status']}」，无法接手")
         old_operator = draft.get("current_operator") or draft["operator"]
         if new_operator == old_operator:
             raise ValueError("您已经是当前操作人，无需接手")
-        self.db.add_draft_handover(draft_id, old_operator, new_operator, reason.strip())
+        old_status = draft.get("status", "")
+        self.db.add_draft_handover(draft_id, old_operator, new_operator, reason.strip(),
+                                   HANDOVER_TYPE_TAKEOVER, new_operator)
+        self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_TAKEOVER, new_operator,
+                                         reason.strip(), old_status, old_status)
         return {
             "from_operator": old_operator,
             "to_operator": new_operator,
         }
 
+    def assign_draft(self, draft_id, assigner, assignee, reason=""):
+        if not assigner:
+            raise ValueError("分派人不能为空")
+        if not assignee:
+            raise ValueError("被分派人不能为空")
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
+            raise ValueError(f"草稿状态为「{draft['status']}」，无法分派")
+        creator = draft["operator"]
+        current_owner = draft.get("current_operator") or creator
+        if assigner != creator and assigner != current_owner:
+            raise ValueError(f"只有创建人「{creator}」或当前操作人「{current_owner}」才能分派")
+        if assignee == current_owner:
+            raise ValueError("被分派人不能与当前操作人相同")
+        old_status = draft.get("status", "")
+        self.db.update_draft_batch(draft_id,
+                                   assigned_by=assigner,
+                                   assigned_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                   assigned_to=assignee,
+                                   assign_reason=reason or "")
+        self.db.add_draft_handover(draft_id, current_owner, assignee, reason or "",
+                                   HANDOVER_TYPE_ASSIGN, assigner)
+        self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_ASSIGN, assigner,
+                                         f"分派给{assignee}: {reason or ''}", old_status, old_status)
+        return {
+            "from_operator": current_owner,
+            "to_operator": assignee,
+            "assigner": assigner,
+        }
+
+    def withdraw_takeover(self, draft_id, withdrawer, reason=""):
+        if not withdrawer:
+            raise ValueError("撤回人不能为空")
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
+            raise ValueError(f"草稿状态为「{draft['status']}」，无法撤回接手")
+        creator = draft["operator"]
+        current_owner = draft.get("current_operator") or creator
+        if withdrawer != creator and withdrawer != current_owner and not draft.get("assigned_by"):
+            raise ValueError(f"只有创建人「{creator}」或当前操作人「{current_owner}」或原分派人才能撤回接手")
+        if withdrawer != creator and draft.get("assigned_by") and withdrawer != draft["assigned_by"]:
+            if withdrawer != current_owner:
+                raise ValueError(f"只有创建人「{creator}」或当前操作人「{current_owner}」或分派人「{draft['assigned_by']}」才能撤回")
+        if current_owner == creator and not draft.get("handover_at"):
+            raise ValueError("草稿当前由创建人持有，无需撤回接手")
+        old_status = draft.get("status", "")
+        previous_owner = creator
+        handover_log = self.db.get_draft_handover_log(draft_id)
+        if len(handover_log) >= 2:
+            for log_entry in reversed(handover_log[:-1]):
+                if log_entry.get("handover_type") in (HANDOVER_TYPE_ASSIGN, HANDOVER_TYPE_TAKEOVER):
+                    previous_owner = log_entry.get("from_operator") or creator
+                    break
+        self.db.add_draft_handover(draft_id, current_owner, previous_owner, reason or "撤回接手",
+                                   HANDOVER_TYPE_WITHDRAW, withdrawer)
+        self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_WITHDRAW_TAKEOVER, withdrawer,
+                                         reason or "撤回接手", old_status, old_status)
+        return {
+            "from_operator": current_owner,
+            "to_operator": previous_owner,
+        }
+
+    def release_draft(self, draft_id, releaser, reason=""):
+        if not releaser:
+            raise ValueError("释放人不能为空")
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
+            raise ValueError(f"草稿状态为「{draft['status']}」，无法释放")
+        creator = draft["operator"]
+        current_owner = draft.get("current_operator") or creator
+        if releaser != current_owner:
+            raise ValueError(f"只有当前操作人「{current_owner}」才能释放责任")
+        old_status = draft.get("status", "")
+        self.db.add_draft_handover(draft_id, current_owner, creator, reason or "释放责任",
+                                   HANDOVER_TYPE_RELEASE, releaser)
+        self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_RELEASE, releaser,
+                                         reason or "释放责任", old_status, old_status)
+        return {
+            "from_operator": current_owner,
+            "to_operator": creator,
+        }
+
+    def check_draft_permissions(self, draft_id, current_user):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            raise ValueError("草稿批次不存在")
+        creator = draft["operator"]
+        current_owner = draft.get("current_operator") or creator
+        assigned_to = draft.get("assigned_to", "")
+        permissions = set()
+        permissions.add(DRAFT_PERM_READONLY)
+        if not current_user:
+            return {
+                "permissions": permissions,
+                "is_creator": False,
+                "is_owner": False,
+                "is_assigned": False,
+                "is_readonly": True,
+            }
+        is_creator = (current_user == creator)
+        is_owner = (current_user == current_owner)
+        is_assigned = (current_user == assigned_to)
+        if is_creator:
+            permissions.add(DRAFT_PERM_CREATE)
+            permissions.add(DRAFT_PERM_ASSIGN)
+            permissions.add(DRAFT_PERM_WITHDRAW)
+            permissions.add(DRAFT_PERM_SUBMIT)
+            permissions.add(DRAFT_PERM_EDIT)
+        if is_owner:
+            permissions.add(DRAFT_PERM_EDIT)
+            permissions.add(DRAFT_PERM_SUBMIT)
+            permissions.add(DRAFT_PERM_ASSIGN)
+            permissions.add(DRAFT_PERM_WITHDRAW)
+        if is_assigned:
+            permissions.add(DRAFT_PERM_EDIT)
+            permissions.add(DRAFT_PERM_SUBMIT)
+        status_submittable = draft["status"] in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED)
+        if not status_submittable and DRAFT_PERM_SUBMIT in permissions:
+            permissions.remove(DRAFT_PERM_SUBMIT)
+        if not status_submittable and DRAFT_PERM_EDIT in permissions:
+            permissions.remove(DRAFT_PERM_EDIT)
+        is_readonly = DRAFT_PERM_EDIT not in permissions
+        return {
+            "permissions": permissions,
+            "is_creator": is_creator,
+            "is_owner": is_owner,
+            "is_assigned": is_assigned,
+            "is_readonly": is_readonly,
+            "has_perm": lambda p: p in permissions,
+        }
+
+    def can_submit_draft(self, draft_id, current_user):
+        draft = self.db.get_draft_batch(draft_id)
+        if not draft:
+            return False, "草稿不存在"
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
+            return False, f"草稿状态为「{draft.get('status','')}」，不能提交"
+        if not current_user:
+            return False, "未登录用户不能提交"
+        creator = draft["operator"]
+        current_owner = draft.get("current_operator") or creator
+        assigned_to = draft.get("assigned_to", "")
+        if current_user == creator or current_user == current_owner or current_user == assigned_to:
+            return True, ""
+        return False, f"只有创建人「{creator}」、当前操作人「{current_owner}」或被分派人「{assigned_to}」可以提交"
+
+    def query_drafts(self, **kwargs):
+        return self.db.query_draft_batches(**kwargs)
+
+    def get_draft_operators(self):
+        return self.db.get_all_draft_operators()
+
+    def get_draft_source_files(self):
+        return self.db.get_all_draft_source_files()
+
+    def get_draft_operation_log(self, draft_id):
+        return self.db.get_draft_operation_log(draft_id)
+
     def get_draft_handover_log(self, draft_id):
         return self.db.get_draft_handover_log(draft_id)
+
+    def create_draft_from_csv(self, filepath, operator, filter_conditions=None, remark=""):
+        if not operator:
+            raise ValueError("操作人不能为空")
+        if not filepath or not os.path.exists(filepath):
+            raise ValueError("CSV文件不存在")
+        records = self.parse_import_file(filepath)
+        if not records:
+            raise ValueError("文件中没有可导入的记录")
+        precheck_results, summary = self.precheck_import(records)
+        return self.create_draft_from_precheck(filepath, operator, precheck_results, summary,
+                                                filter_conditions, remark)
 
     def get_draft_batches(self):
         return self.db.get_draft_batches()
@@ -1920,8 +2350,17 @@ class LightingService:
                 item["current_db_obj"] = None
         return {"draft": draft, "items": items}
 
-    def update_draft_remark(self, draft_id, remark):
+    def update_draft_remark(self, draft_id, remark, operator=""):
+        old_remark = ""
+        draft = self.db.get_draft_batch(draft_id)
+        if draft:
+            old_remark = draft.get("remark", "")
+            status = draft.get("status", "")
         self.db.update_draft_batch(draft_id, remark=remark or "")
+        if operator:
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_EDIT_REMARK, operator,
+                                             f"备注从「{old_remark[:30]}」改为「{remark[:30]}」",
+                                             status, status, 0)
 
     def set_draft_item_selected(self, item_id, selected):
         self.db.set_draft_item_selected(item_id, selected)
@@ -2068,10 +2507,11 @@ class LightingService:
 
         return conflicts
 
-    def refresh_draft_item_from_db(self, item_id, operator_note=""):
+    def refresh_draft_item_from_db(self, item_id, operator_note="", operator=""):
         item = self.db.execute("SELECT * FROM import_draft_items WHERE id=?", (item_id,)).fetchone()
         if not item:
             raise ValueError("草稿项不存在")
+        draft_id = item["draft_id"]
         fixture_no = item["fixture_no"]
         current = self.db.get_fixture_by_no(fixture_no)
 
@@ -2112,22 +2552,50 @@ class LightingService:
             record_data=new_record_data,
             result=new_result,
         )
+        self.db.set_draft_item_resolved_by(item_id, operator)
+        draft = self.db.get_draft_batch(draft_id)
+        if draft and operator:
+            status = draft.get("status", "")
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_CONFLICT_RESOLVE, operator,
+                                             f"{fixture_no}: 刷新后提交 {operator_note}", status, status, 1)
         return True
 
-    def discard_draft_item(self, item_id, operator_note=""):
+    def discard_draft_item(self, item_id, operator_note="", operator=""):
+        item = self.db.execute("SELECT * FROM import_draft_items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise ValueError("草稿项不存在")
+        draft_id = item["draft_id"]
+        fixture_no = item["fixture_no"]
         self.db.resolve_draft_item(
             item_id,
             resolution_action=RESOLUTION_ACTION_DISCARD,
             resolution_note=operator_note,
         )
+        self.db.set_draft_item_resolved_by(item_id, operator)
+        draft = self.db.get_draft_batch(draft_id)
+        if draft and operator:
+            status = draft.get("status", "")
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_CONFLICT_RESOLVE, operator,
+                                             f"{fixture_no}: 放弃 {operator_note}", status, status, 1)
         return True
 
-    def keep_original_draft_item(self, item_id, operator_note=""):
+    def keep_original_draft_item(self, item_id, operator_note="", operator=""):
+        item = self.db.execute("SELECT * FROM import_draft_items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise ValueError("草稿项不存在")
+        draft_id = item["draft_id"]
+        fixture_no = item["fixture_no"]
         self.db.resolve_draft_item(
             item_id,
             resolution_action=RESOLUTION_ACTION_ORIGINAL,
             resolution_note=operator_note,
         )
+        self.db.set_draft_item_resolved_by(item_id, operator)
+        draft = self.db.get_draft_batch(draft_id)
+        if draft and operator:
+            status = draft.get("status", "")
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_CONFLICT_RESOLVE, operator,
+                                             f"{fixture_no}: 原样提交 {operator_note}", status, status, 1)
         return True
 
     def set_item_resolution_note(self, item_id, note):
@@ -2146,19 +2614,19 @@ class LightingService:
         pending = self.db.get_draft_items_pending_conflicts(draft_id)
         return len(pending) > 0
 
-    def submit_draft(self, draft_id, operator, filepath=None):
+    def submit_draft(self, draft_id, operator, filepath=None, allow_partial=True, force_submit_conflicts=False):
         if not operator:
             raise ValueError("操作人不能为空")
 
         draft = self.db.get_draft_batch(draft_id)
         if not draft:
             raise ValueError("草稿批次不存在")
-        if draft["status"] != "draft":
+        if draft["status"] not in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED):
             raise ValueError(f"草稿状态为「{draft['status']}」，无法提交")
 
-        current_owner = draft.get("current_operator") or draft["operator"]
-        if operator != current_owner:
-            raise ValueError(f"当前操作人为「{current_owner}」，只有操作人才能提交草稿。如需提交请先接手。")
+        can_submit, reason = self.can_submit_draft(draft_id, operator)
+        if not can_submit:
+            raise ValueError(reason)
 
         all_conflicts = self.detect_and_persist_conflicts(draft_id, filepath)
 
@@ -2166,36 +2634,41 @@ class LightingService:
         pending_item_conflicts = self.db.get_draft_items_pending_conflicts(draft_id)
 
         if file_level_conflicts or pending_item_conflicts:
-            conflict_msgs = []
-            combined_conflicts = []
-            for fc in file_level_conflicts:
-                conflict_msgs.append(f"[文件级] {fc['detail']}")
-                combined_conflicts.append(fc)
-            for p in pending_item_conflicts:
-                conflict_msgs.append(f"{p['fixture_no']}: {p['conflict_detail']}")
-                compat = dict(p)
-                compat["type"] = p.get("conflict_type", "")
-                combined_conflicts.append(compat)
-            err = ValueError(f"还有 {len(combined_conflicts)} 条冲突未处理，请在冲突工作台中处理后再提交:\n" + "\n".join(conflict_msgs))
-            err.conflicts = combined_conflicts
-            raise err
+            if not force_submit_conflicts:
+                conflict_msgs = []
+                combined_conflicts = []
+                for fc in file_level_conflicts:
+                    conflict_msgs.append(f"[文件级] {fc['detail']}")
+                    combined_conflicts.append(fc)
+                for p in pending_item_conflicts:
+                    conflict_msgs.append(f"{p['fixture_no']}: {p['conflict_detail']}")
+                    compat = dict(p)
+                    compat["type"] = p.get("conflict_type", "")
+                    combined_conflicts.append(compat)
+                err = ValueError(f"还有 {len(combined_conflicts)} 条冲突未处理，请在冲突工作台中处理后再提交:\n" + "\n".join(conflict_msgs))
+                err.conflicts = combined_conflicts
+                raise err
 
-        selected_items = self.db.get_selected_draft_items(draft_id)
         all_draft_items = self.db.get_draft_items(draft_id)
-
-        discarded_items = [it for it in all_draft_items if it.get("resolution_action") == RESOLUTION_ACTION_DISCARD]
+        unsubmitted_items = [it for it in all_draft_items if not it.get("submitted")]
+        selected_items = [it for it in unsubmitted_items if it["selected"]]
+        discarded_items = [it for it in unsubmitted_items if it.get("resolution_action") == RESOLUTION_ACTION_DISCARD]
         committed_items = [it for it in selected_items if it.get("resolution_action") != RESOLUTION_ACTION_DISCARD]
 
         if not committed_items and not discarded_items:
-            raise ValueError("没有选中的记录可提交")
+            raise ValueError("没有可提交的记录（可能已全部提交或未选中）")
 
         error_items = [it for it in committed_items if it["result"] == RESULT_ERROR]
         if error_items:
             raise ValueError(f"选中的记录中有 {len(error_items)} 条错误记录，请先取消选中或修正后再提交")
 
+        total_item_count = len(all_draft_items)
+        already_submitted_count = sum(1 for it in all_draft_items if it.get("submitted"))
+
         total_record_count = len(committed_items) + len(discarded_items)
         batch_no = f"IMP{datetime.now().strftime('%Y%m%d%H%M%S')}{datetime.now().microsecond // 1000:03d}"
         source_name = draft["source_file"]
+        before_status = draft.get("status", "")
 
         self.db.begin_transaction()
         try:
@@ -2208,6 +2681,8 @@ class LightingService:
                 RESOLUTION_ACTION_DISCARD: 0,
                 "none": 0,
             }
+
+            submitted_item_ids = []
 
             for item in committed_items:
                 fixture_no = item["fixture_no"]
@@ -2228,6 +2703,9 @@ class LightingService:
                     error_msg_parts.append("[原样提交]")
                 if resolution_note:
                     error_msg_parts.append(f"备注: {resolution_note}")
+                exported_flag = draft.get("exported_before_submit", 0)
+                if exported_flag:
+                    error_msg_parts.append("[导出后提交]")
                 error_msg = " ".join(error_msg_parts)
 
                 if resolution_action in resolution_counts:
@@ -2290,19 +2768,25 @@ class LightingService:
                 self.db.add_import_batch_item(
                     batch_id, fixture_no, row_idx, result, error_msg, before_snap, after_snap
                 )
+                submitted_item_ids.append(item["id"])
 
             for item in discarded_items:
+                if item.get("submitted"):
+                    continue
                 resolution_counts[RESOLUTION_ACTION_DISCARD] += 1
                 note_str = item.get("resolution_note", "")
                 discard_msg = f"[放弃]"
                 if note_str:
                     discard_msg += f" 备注: {note_str}"
+                if draft.get("exported_before_submit", 0):
+                    discard_msg += " [导出后提交]"
                 self.db.add_import_batch_item(
                     batch_id, item["fixture_no"], item["row_index"], RESULT_SKIP,
                     discard_msg,
                     item["before_snapshot"], item["after_snapshot"],
                 )
                 counts[RESULT_SKIP] += 1
+                submitted_item_ids.append(item["id"])
 
             self.db.update_import_batch_counts(
                 batch_id, counts[RESULT_NEW], counts[RESULT_UPDATE], counts[RESULT_SKIP], counts[RESULT_ERROR]
@@ -2314,7 +2798,37 @@ class LightingService:
             )
             self.db.update_import_batch_status(batch_id, "completed", status_msg)
 
-            self.db.update_draft_batch(draft_id, status="submitted")
+            self.db.set_draft_items_submitted(draft_id, submitted_item_ids)
+
+            all_items_now = self.db.get_draft_items(draft_id)
+            all_submitted_now = all(it.get("submitted") for it in all_items_now)
+            has_any_conflict = any(it.get("conflict_status") for it in all_items_now)
+            if all_submitted_now:
+                if has_any_conflict:
+                    new_draft_status = DRAFT_STATUS_CONFLICT_SUBMITTED
+                else:
+                    new_draft_status = DRAFT_STATUS_SUBMITTED
+                processing_completed = True
+                operation_name = DRAFT_OPERATION_SUBMIT
+            else:
+                if has_any_conflict:
+                    new_draft_status = DRAFT_STATUS_CONFLICT_SUBMITTED
+                else:
+                    new_draft_status = DRAFT_STATUS_PARTIAL
+                processing_completed = False
+                operation_name = DRAFT_OPERATION_PARTIAL_SUBMIT
+                if not allow_partial:
+                    self.db.rollback_transaction()
+                    raise ValueError("存在未提交的记录，当前不允许部分提交")
+
+            self.db.increment_draft_submit_count(draft_id, new_draft_status, processing_completed)
+            self.db.update_draft_batch(draft_id, status=new_draft_status)
+
+            affected_count = len(committed_items) + len(discarded_items)
+            operation_detail = f"提交批次 {batch_no}: 新增{counts[RESULT_NEW]} 更新{counts[RESULT_UPDATE]} 跳过/放弃{counts[RESULT_SKIP]}"
+            self.db.set_draft_last_operation(draft_id, operation_name, operator,
+                                             operation_detail, before_status, new_draft_status,
+                                             affected_count)
 
             self.db.commit()
 
@@ -2322,6 +2836,8 @@ class LightingService:
                 "batch_id": batch_id,
                 "batch_no": batch_no,
                 "success": True,
+                "is_partial": not all_submitted_now,
+                "has_conflicts": has_any_conflict,
                 "resolution_original": resolution_counts[RESOLUTION_ACTION_ORIGINAL],
                 "resolution_refresh": resolution_counts[RESOLUTION_ACTION_REFRESH],
                 "resolution_discard": resolution_counts[RESOLUTION_ACTION_DISCARD],
@@ -2336,6 +2852,9 @@ class LightingService:
                     "resolution_original": resolution_counts[RESOLUTION_ACTION_ORIGINAL],
                     "resolution_refresh": resolution_counts[RESOLUTION_ACTION_REFRESH],
                     "resolution_discard": resolution_counts[RESOLUTION_ACTION_DISCARD],
+                    "total_in_draft": total_item_count,
+                    "already_submitted": already_submitted_count,
+                    "remaining_unsubmitted": total_item_count - already_submitted_count - len(submitted_item_ids),
                 },
             }
             return result_obj
@@ -2344,7 +2863,7 @@ class LightingService:
             self.db.rollback_transaction()
             raise
 
-    def export_draft_items(self, draft_id, directory, filename, selected_only=False):
+    def export_draft_items(self, draft_id, directory, filename, selected_only=False, operator=""):
         draft = self.db.get_draft_batch(draft_id)
         if not draft:
             raise ValueError("草稿批次不存在")
@@ -2364,9 +2883,37 @@ class LightingService:
         creator = draft["operator"]
         current_operator = draft.get("current_operator") or creator
         handover_reason = draft.get("handover_reason", "")
+        assign_to = draft.get("assigned_to", "")
+        assign_by = draft.get("assigned_by", "")
+        assign_reason = draft.get("assign_reason", "")
+        last_operation = draft.get("last_operation", "")
+        last_operation_at = draft.get("last_operation_at", "")
+        last_operation_by = draft.get("last_operation_by", "")
+        submit_count = draft.get("submit_count", 0)
+        exported_before = draft.get("exported_before_submit", 0)
+        status_display = DRAFT_STATUS_DISPLAY.get(draft.get("status", ""), draft.get("status", ""))
+
+        handover_log = self.db.get_draft_handover_log(draft_id)
+        last_handover_to = ""
+        last_handover_at = ""
+        if handover_log:
+            for log_entry in reversed(handover_log):
+                if log_entry.get("handover_type") in (HANDOVER_TYPE_ASSIGN, HANDOVER_TYPE_TAKEOVER):
+                    last_handover_to = log_entry.get("to_operator", "")
+                    last_handover_at = log_entry.get("created_at", "")
+                    break
+
         with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["行号", "灯具编号", "结果", "是否选中", "信息", "变更详情", "冲突状态", "处理方式", "处理备注", "创建人", "最近接手人", "交接备注"])
+            writer.writerow([
+                "行号", "灯具编号", "结果", "是否选中", "是否已提交", "提交时间",
+                "信息", "变更详情",
+                "冲突状态", "处理方式", "处理备注", "处理时间", "处理人",
+                "创建人", "当前操作人", "最近接手人", "最近接手时间", "交接备注",
+                "分派人", "分派给", "分派原因",
+                "草稿状态", "提交次数", "是否导出过",
+                "最近操作", "最近操作时间", "最近操作人",
+            ])
             for item in items:
                 detail_parts = []
                 if item["before_snapshot"] and item["after_snapshot"]:
@@ -2381,6 +2928,8 @@ class LightingService:
                             detail_parts.append(f"{field}: {old_val} → {new_val}")
                 detail = "; ".join(detail_parts)
                 selected_str = "是" if item["selected"] else "否"
+                submitted_str = "是" if item.get("submitted") else "否"
+                submitted_at = item.get("submitted_at", "")
                 msg = item["error_message"] or (item["result"] == RESULT_NEW and "新增") or (item["result"] == RESULT_UPDATE and "更新") or (item["result"] == RESULT_SKIP and "跳过（无变化）") or ""
                 conflict_status_display = {
                     CONFLICT_STATUS_NONE: "无",
@@ -2395,13 +2944,23 @@ class LightingService:
                     RESOLUTION_ACTION_DISCARD: "放弃",
                 }.get(item.get("resolution_action", ""), item.get("resolution_action", ""))
                 writer.writerow([
-                    item["row_index"], item["fixture_no"], item["result"], selected_str, msg, detail,
-                    conflict_status_display, resolution_display, item.get("resolution_note", ""),
-                    creator, current_operator, handover_reason
+                    item["row_index"], item["fixture_no"], item["result"], selected_str, submitted_str, submitted_at,
+                    msg, detail,
+                    conflict_status_display, resolution_display,
+                    item.get("resolution_note", ""), item.get("resolved_at", ""), item.get("resolved_by", ""),
+                    creator, current_operator, last_handover_to, last_handover_at, handover_reason,
+                    assign_by, assign_to, assign_reason,
+                    status_display, submit_count, "是" if exported_before else "否",
+                    last_operation, last_operation_at, last_operation_by,
                 ])
+        if operator:
+            before_status = draft.get("status", "")
+            self.db.set_draft_export_record(draft_id, operator)
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_EXPORT, operator,
+                                             f"导出明细到 {filename}", before_status, before_status, len(items))
         return str(filepath)
 
-    def export_draft_conflicts(self, draft_id, directory, filename):
+    def export_draft_conflicts(self, draft_id, directory, filename, operator=""):
         draft = self.db.get_draft_batch(draft_id)
         if not draft:
             raise ValueError("草稿批次不存在")
@@ -2418,14 +2977,28 @@ class LightingService:
         creator = draft["operator"]
         current_operator = draft.get("current_operator") or creator
         handover_reason = draft.get("handover_reason", "")
+        assign_to = draft.get("assigned_to", "")
+        assign_by = draft.get("assigned_by", "")
+
+        handover_log = self.db.get_draft_handover_log(draft_id)
+        last_handover_to = ""
+        last_handover_at = ""
+        if handover_log:
+            for log_entry in reversed(handover_log):
+                if log_entry.get("handover_type") in (HANDOVER_TYPE_ASSIGN, HANDOVER_TYPE_TAKEOVER):
+                    last_handover_to = log_entry.get("to_operator", "")
+                    last_handover_at = log_entry.get("created_at", "")
+                    break
+
         with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
             writer.writerow([
                 "行号", "灯具编号", "冲突类型", "冲突原因",
                 "草稿值-型号", "草稿值-状态", "草稿值-库位", "草稿值-负责人",
                 "库内值-型号", "库内值-状态", "库内值-库位", "库内值-负责人",
-                "处理状态", "处理方式", "处理备注", "处理时间",
-                "创建人", "最近接手人", "交接备注"
+                "处理状态", "处理方式", "处理备注", "处理时间", "处理人",
+                "创建人", "当前操作人", "最近接手人", "最近接手时间", "交接备注",
+                "分派人", "分派给",
             ])
             for item in conflict_items:
                 draft_snap = {}
@@ -2470,9 +3043,15 @@ class LightingService:
                     db_snap.get("model", ""), db_snap.get("status", ""),
                     db_snap.get("location", ""), db_snap.get("person_in_charge", ""),
                     conflict_status_display, resolution_display,
-                    item.get("resolution_note", ""), item.get("resolved_at", ""),
-                    creator, current_operator, handover_reason
+                    item.get("resolution_note", ""), item.get("resolved_at", ""), item.get("resolved_by", ""),
+                    creator, current_operator, last_handover_to, last_handover_at, handover_reason,
+                    assign_by, assign_to,
                 ])
+        if operator:
+            before_status = draft.get("status", "")
+            self.db.set_draft_export_record(draft_id, operator)
+            self.db.set_draft_last_operation(draft_id, DRAFT_OPERATION_EXPORT, operator,
+                                             f"导出冲突清单到 {filename}", before_status, before_status, len(conflict_items))
         return str(filepath)
 
     def export_batch_final_detail(self, batch_id, directory, filename):
@@ -3639,88 +4218,445 @@ class BatchHistoryDialog(tk.Toplevel):
 
 
 class DraftListDialog(tk.Toplevel):
-    def __init__(self, parent, service):
+    def __init__(self, parent, service, current_user=""):
         super().__init__(parent)
-        self.title("导入草稿批次")
+        self.title("草稿托管与交接台")
         self.result = None
         self.service = service
+        self.current_user = current_user
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
 
+        self._current_filters = {
+            "creator": "",
+            "current_operator": "",
+            "status": "",
+            "conflict_status": "",
+            "date_start": "",
+            "date_end": "",
+            "source_file": "",
+        }
+
         main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
-        cols = ("draft_no", "created_at", "updated_at", "operator", "current_operator", "source_file",
-                "total", "new_count", "update_count", "skip_count", "error_count", "remark")
+        filter_frame = ttk.LabelFrame(main, text="筛选条件", padding=8)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        all_ops = [""] + (service.get_draft_operators() if hasattr(service, 'get_draft_operators') else [])
+        all_statuses = [""] + list(DRAFT_STATUS_DISPLAY.values())
+        all_conflicts = ["", "无冲突", "待处理", "已处理", "已放弃"]
+        all_sources = [""] + (service.get_draft_source_files() if hasattr(service, 'get_draft_source_files') else [])
+
+        ttk.Label(filter_frame, text="创建人:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky="e")
+        self.filter_creator = ttk.Combobox(filter_frame, width=12, values=all_ops)
+        self.filter_creator.grid(row=0, column=1, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="当前操作人:").grid(row=0, column=2, padx=(0, 4), pady=2, sticky="e")
+        self.filter_operator = ttk.Combobox(filter_frame, width=12, values=all_ops)
+        self.filter_operator.grid(row=0, column=3, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="草稿状态:").grid(row=0, column=4, padx=(0, 4), pady=2, sticky="e")
+        self.filter_status = ttk.Combobox(filter_frame, width=12, values=all_statuses)
+        self.filter_status.grid(row=0, column=5, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="冲突状态:").grid(row=0, column=6, padx=(0, 4), pady=2, sticky="e")
+        self.filter_conflict = ttk.Combobox(filter_frame, width=10, values=all_conflicts)
+        self.filter_conflict.grid(row=0, column=7, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="创建起始:").grid(row=1, column=0, padx=(0, 4), pady=2, sticky="e")
+        self.filter_date_start = ttk.Entry(filter_frame, width=12)
+        self.filter_date_start.grid(row=1, column=1, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="创建结束:").grid(row=1, column=2, padx=(0, 4), pady=2, sticky="e")
+        self.filter_date_end = ttk.Entry(filter_frame, width=12)
+        self.filter_date_end.grid(row=1, column=3, padx=(0, 12), pady=2)
+
+        ttk.Label(filter_frame, text="来源批次:").grid(row=1, column=4, padx=(0, 4), pady=2, sticky="e")
+        self.filter_source = ttk.Combobox(filter_frame, width=18, values=all_sources)
+        self.filter_source.grid(row=1, column=5, columnspan=2, padx=(0, 12), pady=2, sticky="ew")
+
+        ttk.Button(filter_frame, text="筛选", command=self._on_apply_filter, width=8).grid(row=0, column=8, padx=4, rowspan=2)
+        ttk.Button(filter_frame, text="重置", command=self._on_reset_filter, width=8).grid(row=0, column=9, padx=4, rowspan=2)
+
+        cols = ("draft_no", "status_display", "created_at", "last_operation_at", "operator", "current_operator",
+                "assigned_to", "source_file", "total", "submitted_cnt", "conflict_pending",
+                "submit_count", "last_operation", "remark")
         self.tree = ttk.Treeview(main, columns=cols, show="headings", height=12)
         headers = [
-            ("draft_no", "草稿号", 140),
-            ("created_at", "创建时间", 140),
-            ("updated_at", "更新时间", 140),
-            ("operator", "创建人", 80),
+            ("draft_no", "草稿号", 150),
+            ("status_display", "状态", 80),
+            ("created_at", "创建时间", 130),
+            ("last_operation_at", "最近操作时间", 130),
+            ("operator", "创建人", 70),
             ("current_operator", "当前操作人", 80),
-            ("source_file", "来源文件", 160),
+            ("assigned_to", "分派给", 70),
+            ("source_file", "来源批次/文件", 150),
             ("total", "总数", 50),
-            ("new_count", "新增", 50),
-            ("update_count", "更新", 50),
-            ("skip_count", "跳过", 50),
-            ("error_count", "错误", 50),
-            ("remark", "备注", 200),
+            ("submitted_cnt", "已提交", 60),
+            ("conflict_pending", "待处理冲突", 80),
+            ("submit_count", "提交次数", 70),
+            ("last_operation", "最近操作", 120),
+            ("remark", "备注", 180),
         ]
         for col_id, col_name, col_w in headers:
             self.tree.heading(col_id, text=col_name, anchor="center")
-            self.tree.column(col_id, width=col_w, anchor="center")
+            self.tree.column(col_id, width=col_w, anchor="center" if col_id != "remark" and col_id != "source_file" else "w")
+
+        self.tree.tag_configure("status_draft", background="#e3f2fd")
+        self.tree.tag_configure("status_partial", background="#fff8e1")
+        self.tree.tag_configure("status_conflict", background="#ffebee")
+        self.tree.tag_configure("status_submitted", background="#e8f5e9")
+        self.tree.tag_configure("has_conflict", background="#fff3e0")
 
         self._refresh_drafts()
         self.tree.bind("<<TreeviewSelect>>", self._on_select_draft)
+        self.tree.bind("<Double-1>", lambda e: self._on_edit())
 
-        vsb = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        tree_wrap = ttk.Frame(main)
+        tree_wrap.pack(fill="both", expand=True)
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+
+        self.info_label = ttk.Label(main, text="", foreground="#555")
+        self.info_label.pack(fill="x", pady=(6, 2))
 
         btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill="x", pady=(10, 0))
+        btn_frame.pack(fill="x", pady=(6, 0))
 
-        ttk.Button(btn_frame, text="新建草稿...", command=self._on_new, width=14).pack(side="left", padx=4)
-        self.btn_edit = ttk.Button(btn_frame, text="编辑草稿", command=self._on_edit, width=12, state="disabled")
-        self.btn_edit.pack(side="left", padx=4)
-        self.btn_submit = ttk.Button(btn_frame, text="提交选中", command=self._on_submit, width=12, state="disabled")
-        self.btn_submit.pack(side="left", padx=4)
-        self.btn_delete = ttk.Button(btn_frame, text="删除草稿", command=self._on_delete, width=12, state="disabled")
-        self.btn_delete.pack(side="left", padx=4)
-        self.btn_export = ttk.Button(btn_frame, text="导出明细", command=self._on_export, width=12, state="disabled")
-        self.btn_export.pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="CSV导入建草稿...", command=self._on_import_csv, width=14).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="新建草稿...", command=self._on_new, width=12).pack(side="left", padx=3)
 
-        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=12).pack(side="right")
+        op_frame = ttk.LabelFrame(btn_frame, text="交接操作", padding=3)
+        op_frame.pack(side="left", padx=8)
 
-        self.geometry("1130x550")
+        self.btn_assign = ttk.Button(op_frame, text="分派...", command=self._on_assign, width=8, state="disabled")
+        self.btn_assign.pack(side="left", padx=2)
+        self.btn_withdraw = ttk.Button(op_frame, text="撤回接手", command=self._on_withdraw, width=8, state="disabled")
+        self.btn_withdraw.pack(side="left", padx=2)
+        self.btn_release = ttk.Button(op_frame, text="释放责任", command=self._on_release, width=8, state="disabled")
+        self.btn_release.pack(side="left", padx=2)
+
+        data_frame = ttk.LabelFrame(btn_frame, text="数据操作", padding=3)
+        data_frame.pack(side="left", padx=8)
+
+        self.btn_edit = ttk.Button(data_frame, text="编辑/查看", command=self._on_edit, width=10, state="disabled")
+        self.btn_edit.pack(side="left", padx=2)
+        self.btn_submit = ttk.Button(data_frame, text="提交", command=self._on_submit, width=8, state="disabled")
+        self.btn_submit.pack(side="left", padx=2)
+        self.btn_export = ttk.Button(data_frame, text="导出明细", command=self._on_export, width=8, state="disabled")
+        self.btn_export.pack(side="left", padx=2)
+        self.btn_log = ttk.Button(data_frame, text="操作日志", command=self._on_view_log, width=8, state="disabled")
+        self.btn_log.pack(side="left", padx=2)
+        self.btn_delete = ttk.Button(data_frame, text="删除", command=self._on_delete, width=6, state="disabled")
+        self.btn_delete.pack(side="left", padx=2)
+
+        user_frame = ttk.Frame(btn_frame)
+        user_frame.pack(side="left", padx=10)
+        ttk.Label(user_frame, text="当前用户:").pack(side="left")
+        self.user_var = tk.StringVar(value=current_user or "")
+        self.user_entry = ttk.Entry(user_frame, textvariable=self.user_var, width=10)
+        self.user_entry.pack(side="left", padx=4)
+        ttk.Button(user_frame, text="刷新", command=self._on_refresh_user, width=6).pack(side="left")
+
+        ttk.Button(btn_frame, text="关闭", command=self._cancel, width=10).pack(side="right")
+
+        self.geometry("1380x640")
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.wait_window()
 
+    def _on_refresh_user(self):
+        self.current_user = self.user_var.get().strip()
+        self._refresh_drafts()
+        self._on_select_draft()
+        messagebox.showinfo("提示", f"当前用户已切换为: {self.current_user or '(未登录)'}")
+
+    def _collect_filter_values(self):
+        conflict_map = {"无冲突": CONFLICT_STATUS_NONE, "待处理": CONFLICT_STATUS_PENDING,
+                        "已处理": CONFLICT_STATUS_RESOLVED, "已放弃": CONFLICT_STATUS_DISCARDED}
+        status_map = {v: k for k, v in DRAFT_STATUS_DISPLAY.items()}
+        self._current_filters = {
+            "creator": self.filter_creator.get().strip() or None,
+            "current_operator": self.filter_operator.get().strip() or None,
+            "status": status_map.get(self.filter_status.get().strip()) or (self.filter_status.get().strip() or None),
+            "conflict_status": conflict_map.get(self.filter_conflict.get().strip()) or None,
+            "date_start": self.filter_date_start.get().strip() or None,
+            "date_end": self.filter_date_end.get().strip() or None,
+            "source_file": self.filter_source.get().strip() or None,
+        }
+
+    def _on_apply_filter(self):
+        if self._current_filters.get("date_start"):
+            try:
+                date.fromisoformat(self._current_filters["date_start"])
+            except ValueError:
+                messagebox.showerror("格式错误", "创建起始日期格式应为 YYYY-MM-DD")
+                return
+        if self._current_filters.get("date_end"):
+            try:
+                date.fromisoformat(self._current_filters["date_end"])
+            except ValueError:
+                messagebox.showerror("格式错误", "创建结束日期格式应为 YYYY-MM-DD")
+                return
+        self._refresh_drafts()
+
+    def _on_reset_filter(self):
+        for w in [self.filter_creator, self.filter_operator, self.filter_status,
+                  self.filter_conflict, self.filter_date_start, self.filter_date_end, self.filter_source]:
+            w.set("") if hasattr(w, 'set') else w.delete(0, "end")
+        self._current_filters = {k: "" for k in self._current_filters}
+        self._refresh_drafts()
+
     def _refresh_drafts(self):
+        self._collect_filter_values()
         self.tree.delete(*self.tree.get_children())
-        drafts = self.service.get_draft_batches()
+
+        f = self._current_filters
+        drafts = self.service.query_drafts(
+            creator=f["creator"], current_operator=f["current_operator"],
+            status=f["status"], conflict_status=f["conflict_status"],
+            date_start=f["date_start"], date_end=f["date_end"],
+            source_file=f["source_file"],
+        ) if hasattr(self.service, 'query_drafts') else self.service.get_draft_batches()
+
+        user = self.current_user
+        total_count = len(drafts)
+        mine_count = sum(1 for d in drafts if (d.get("current_operator") or d["operator"]) == user or d["operator"] == user)
+
         for d in drafts:
+            status_raw = d.get("status", DRAFT_STATUS_DRAFT)
+            status_display = DRAFT_STATUS_DISPLAY.get(status_raw, status_raw)
             cur_op = d.get("current_operator") or d["operator"]
-            self.tree.insert("", "end", iid=str(d["id"]), values=(
-                d["draft_no"], d["created_at"], d["updated_at"],
-                d["operator"], cur_op, d["source_file"],
-                d["record_count"], d["new_count"], d["update_count"],
-                d["skip_count"], d["error_count"], d["remark"]
-            ))
+            submitted_cnt = sum(1 for it in (self.service.db.get_draft_items(d["id"]) if False else []) if it.get("submitted"))
+            try:
+                conflicts = self.service.db.get_draft_conflicts_summary_full(d["id"]) if hasattr(self.service.db, 'get_draft_conflicts_summary_full') else {CONFLICT_STATUS_PENDING: 0}
+            except Exception:
+                conflicts = {CONFLICT_STATUS_PENDING: 0}
+            pending_count = conflicts.get(CONFLICT_STATUS_PENDING, 0)
+
+            tags = []
+            if status_raw == DRAFT_STATUS_DRAFT:
+                tags.append("status_draft")
+            elif status_raw == DRAFT_STATUS_PARTIAL:
+                tags.append("status_partial")
+            elif status_raw == DRAFT_STATUS_CONFLICT_SUBMITTED:
+                tags.append("status_conflict")
+            elif status_raw == DRAFT_STATUS_SUBMITTED:
+                tags.append("status_submitted")
+            if pending_count > 0:
+                tags.append("has_conflict")
+
+            iid = str(d["id"])
+            self.tree.insert("", "end", iid=iid, values=(
+                d["draft_no"], status_display, d["created_at"],
+                d.get("last_operation_at", ""),
+                d["operator"], cur_op,
+                d.get("assigned_to", ""), d["source_file"],
+                d["record_count"], submitted_cnt,
+                pending_count, d.get("submit_count", 0),
+                d.get("last_operation", "") or (d.get("handover_reason") and f"交接:{d['handover_reason'][:12]}") or "",
+                d.get("remark", "")
+            ), tags=tuple(tags) if tags else ())
+
+        self.info_label.config(text=f"共 {total_count} 条草稿，与我相关 {mine_count} 条 | 当前用户: {self.current_user or '(未登录/只读)'}")
 
     def _on_select_draft(self, event=None):
         sel = self.tree.selection()
         has_sel = bool(sel)
+        user = self.current_user
+
+        for btn in [self.btn_edit, self.btn_submit, self.btn_export, self.btn_log, self.btn_delete,
+                    self.btn_assign, self.btn_withdraw, self.btn_release]:
+            btn.config(state="normal" if has_sel else "disabled")
+
+        if not has_sel:
+            return
+
+        draft_id = int(sel[0])
+        try:
+            perms = self.service.check_draft_permissions(draft_id, user)
+        except Exception:
+            return
+
+        is_readonly = perms["is_readonly"]
+        has_edit = not is_readonly
+        has_submit = DRAFT_PERM_SUBMIT in perms["permissions"]
+        has_assign = DRAFT_PERM_ASSIGN in perms["permissions"]
+        has_withdraw = DRAFT_PERM_WITHDRAW in perms["permissions"]
+        is_creator = perms["is_creator"]
+
+        draft = self.service.db.get_draft_batch(draft_id)
+        current_owner = draft.get("current_operator") or draft["operator"]
+        creator = draft["operator"]
+        in_progress = draft.get("status", DRAFT_STATUS_DRAFT) in (DRAFT_STATUS_DRAFT, DRAFT_STATUS_PARTIAL, DRAFT_STATUS_CONFLICT_SUBMITTED)
+        has_handover = bool(draft.get("handover_at"))
+        can_release = (user == current_owner) and in_progress and current_owner != creator and has_edit
+
         self.btn_edit.config(state="normal" if has_sel else "disabled")
-        self.btn_submit.config(state="normal" if has_sel else "disabled")
-        self.btn_delete.config(state="normal" if has_sel else "disabled")
+        self.btn_submit.config(state="normal" if has_submit else "disabled")
+        self.btn_assign.config(state="normal" if has_assign and in_progress else "disabled")
+        self.btn_withdraw.config(state="normal" if has_withdraw and in_progress and has_handover else "disabled")
+        self.btn_release.config(state="normal" if can_release else "disabled")
+        self.btn_delete.config(state="normal" if is_creator else "disabled")
         self.btn_export.config(state="normal" if has_sel else "disabled")
+        self.btn_log.config(state="normal" if has_sel else "disabled")
+
+        if is_readonly and has_sel:
+            self.btn_edit.config(text="查看")
+        else:
+            self.btn_edit.config(text="编辑/查看")
+
+    def _on_import_csv(self):
+        if not self.current_user:
+            messagebox.showwarning("提示", "请先在\"当前用户\"处填写操作人姓名")
+            return
+        fp = filedialog.askopenfilename(parent=self, title="选择CSV文件导入",
+                                        filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")])
+        if not fp:
+            return
+        try:
+            result = self.service.create_draft_from_csv(fp, self.current_user, remark="从CSV导入创建")
+            self._refresh_drafts()
+            messagebox.showinfo("成功", f"已创建草稿 {result['draft_no']}")
+            iid = str(result["draft_id"])
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+        except Exception as e:
+            messagebox.showerror("导入失败", str(e))
+
+    def _on_assign(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        draft = self.service.db.get_draft_batch(draft_id)
+        if not draft:
+            return
+        fields = [
+            ("assignee", "分派给(操作人姓名)", ""),
+            ("reason", "分派原因", ""),
+        ]
+        dlg = FormDialog(self, f"分派草稿 {draft['draft_no']}", fields, width=380)
+        if not dlg.result:
+            return
+        assignee = dlg.result["assignee"].strip()
+        reason = dlg.result["reason"].strip()
+        if not assignee:
+            messagebox.showerror("错误", "被分派人不能为空")
+            return
+        try:
+            self.service.assign_draft(draft_id, self.current_user, assignee, reason)
+            self._refresh_drafts()
+            messagebox.showinfo("成功", f"已分派给 {assignee}")
+        except Exception as e:
+            messagebox.showerror("分派失败", str(e))
+
+    def _on_withdraw(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        draft = self.service.db.get_draft_batch(draft_id)
+        if not draft:
+            return
+        fields = [("reason", "撤回原因", "撤回接手")]
+        dlg = FormDialog(self, f"撤回接手 {draft['draft_no']}", fields, width=360)
+        if not dlg.result:
+            return
+        reason = dlg.result["reason"].strip()
+        try:
+            self.service.withdraw_takeover(draft_id, self.current_user, reason)
+            self._refresh_drafts()
+            messagebox.showinfo("成功", "已撤回接手，责任归还")
+        except Exception as e:
+            messagebox.showerror("撤回失败", str(e))
+
+    def _on_release(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        draft = self.service.db.get_draft_batch(draft_id)
+        if not draft:
+            return
+        if not messagebox.askyesno("确认释放", f"确定要释放草稿 {draft['draft_no']} 的处理责任吗？\n责任将归还给创建人「{draft['operator']}」。"):
+            return
+        fields = [("reason", "释放原因(可选)", "")]
+        dlg = FormDialog(self, f"释放责任 {draft['draft_no']}", fields, width=360)
+        reason = (dlg.result["reason"].strip()) if dlg.result else ""
+        try:
+            self.service.release_draft(draft_id, self.current_user, reason)
+            self._refresh_drafts()
+            messagebox.showinfo("成功", "已释放责任")
+        except Exception as e:
+            messagebox.showerror("释放失败", str(e))
+
+    def _on_view_log(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        draft_id = int(sel[0])
+        try:
+            handover_log = self.service.get_draft_handover_log(draft_id)
+            operation_log = self.service.get_draft_operation_log(draft_id) if hasattr(self.service, 'get_draft_operation_log') else []
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"操作日志与交接历史")
+        dlg.resizable(True, True)
+        dlg.transient(self)
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        op_tab = ttk.Frame(nb, padding=6)
+        nb.add(op_tab, text=" 操作日志 ")
+        op_cols = ("time", "op", "user", "detail", "before", "after", "affected")
+        op_tree = ttk.Treeview(op_tab, columns=op_cols, show="headings", height=10)
+        for c, t, w in [("time", "时间", 130), ("op", "操作", 90), ("user", "操作人", 70),
+                        ("detail", "详情", 300), ("before", "原状态", 80),
+                        ("after", "新状态", 80), ("affected", "影响数", 60)]:
+            op_tree.heading(c, text=t, anchor="center")
+            op_tree.column(c, width=w, anchor="center" if c != "detail" else "w")
+        for log in operation_log:
+            op_tree.insert("", "end", values=(log.get("created_at",""), log.get("operation",""),
+                log.get("operator",""), log.get("detail",""), log.get("before_status",""),
+                log.get("after_status",""), log.get("affected_items","")))
+        op_tree.pack(fill="both", expand=True, side="left")
+        sb1 = ttk.Scrollbar(op_tab, orient="vertical", command=op_tree.yview)
+        op_tree.configure(yscrollcommand=sb1.set); sb1.pack(side="right", fill="y")
+
+        ho_tab = ttk.Frame(nb, padding=6)
+        nb.add(ho_tab, text=" 交接历史 ")
+        ho_cols = ("time", "type", "from", "to", "reason", "op")
+        ho_tree = ttk.Treeview(ho_tab, columns=ho_cols, show="headings", height=10)
+        type_map = {HANDOVER_TYPE_ASSIGN: "分派", HANDOVER_TYPE_TAKEOVER: "接手",
+                    HANDOVER_TYPE_WITHDRAW: "撤回", HANDOVER_TYPE_RELEASE: "释放"}
+        for c, t, w in [("time", "时间", 130), ("type", "类型", 70), ("from", "从", 80),
+                        ("to", "到", 80), ("reason", "原因", 260), ("op", "触发人", 70)]:
+            ho_tree.heading(c, text=t, anchor="center")
+            ho_tree.column(c, width=w, anchor="center" if c != "reason" else "w")
+        for log in handover_log:
+            ho_tree.insert("", "end", values=(log.get("created_at",""),
+                type_map.get(log.get("handover_type",""), log.get("handover_type","接手")),
+                log.get("from_operator",""), log.get("to_operator",""),
+                log.get("reason",""), log.get("operator","")))
+        ho_tree.pack(fill="both", expand=True, side="left")
+        sb2 = ttk.Scrollbar(ho_tab, orient="vertical", command=ho_tree.yview)
+        ho_tree.configure(yscrollcommand=sb2.set); sb2.pack(side="right", fill="y")
+
+        ttk.Button(dlg, text="关闭", command=dlg.destroy, width=12).pack(pady=8)
+        dlg.geometry("820x480")
+        dlg.grab_set()
 
     def _on_new(self):
-        self.result = {"action": "new"}
+        self.result = {"action": "new", "current_user": self.current_user}
         self.destroy()
 
     def _on_edit(self):
@@ -3728,7 +4664,7 @@ class DraftListDialog(tk.Toplevel):
         if not sel:
             return
         draft_id = int(sel[0])
-        self.result = {"action": "edit", "draft_id": draft_id}
+        self.result = {"action": "edit", "draft_id": draft_id, "current_user": self.current_user}
         self.destroy()
 
     def _on_submit(self):
@@ -3736,7 +4672,7 @@ class DraftListDialog(tk.Toplevel):
         if not sel:
             return
         draft_id = int(sel[0])
-        self.result = {"action": "submit", "draft_id": draft_id}
+        self.result = {"action": "submit", "draft_id": draft_id, "current_user": self.current_user}
         self.destroy()
 
     def _on_delete(self):
@@ -3761,7 +4697,7 @@ class DraftListDialog(tk.Toplevel):
         if not sel:
             return
         draft_id = int(sel[0])
-        self.result = {"action": "export", "draft_id": draft_id}
+        self.result = {"action": "export", "draft_id": draft_id, "current_user": self.current_user}
         self.destroy()
 
     def _cancel(self):
@@ -3793,7 +4729,10 @@ class DraftEditDialog(tk.Toplevel):
 
         draft = self.detail["draft"]
         current_owner = draft.get("current_operator") or draft["operator"]
-        if current_user and current_user != current_owner:
+        try:
+            perms = self.service.check_draft_permissions(self.draft_id, current_user)
+            self.is_readonly = perms["is_readonly"]
+        except Exception:
             self.is_readonly = True
 
         try:
@@ -3823,6 +4762,20 @@ class DraftEditDialog(tk.Toplevel):
         lock_status = ""
         if self.is_readonly:
             lock_status = f"    🔒 只读模式（当前操作人: {current_owner_display}）"
+        else:
+            role_parts = []
+            try:
+                perms = self.service.check_draft_permissions(self.draft_id, current_user)
+                if perms.get("is_creator"):
+                    role_parts.append("创建人")
+                if perms.get("is_owner"):
+                    role_parts.append("当前操作人")
+                if perms.get("is_assigned"):
+                    role_parts.append("被分派人")
+            except Exception:
+                pass
+            if role_parts:
+                lock_status = f"    ✏️ 可编辑（角色: {'/'.join(role_parts)}）"
         info_text = (
             f"草稿号: {draft['draft_no']}    "
             f"创建人: {draft['operator']}    "
@@ -4222,7 +5175,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for item_id in ids:
-                self.service.refresh_draft_item_from_db(item_id, note)
+                self.service.refresh_draft_item_from_db(item_id, note, operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已将 {len(ids)} 条记录按库内最新状态刷新")
         except Exception as e:
@@ -4237,7 +5190,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for item_id in ids:
-                self.service.keep_original_draft_item(item_id, note)
+                self.service.keep_original_draft_item(item_id, note, operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已标记 {len(ids)} 条记录按草稿原样提交")
         except Exception as e:
@@ -4254,7 +5207,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for item_id in ids:
-                self.service.discard_draft_item(item_id, note)
+                self.service.discard_draft_item(item_id, note, operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已放弃 {len(ids)} 条记录")
         except Exception as e:
@@ -4289,7 +5242,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for p in pending:
-                self.service.refresh_draft_item_from_db(p["id"], "批量刷新")
+                self.service.refresh_draft_item_from_db(p["id"], "批量刷新", operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已批量刷新 {len(pending)} 条记录")
         except Exception as e:
@@ -4304,7 +5257,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for p in pending:
-                self.service.keep_original_draft_item(p["id"], "批量原样提交")
+                self.service.keep_original_draft_item(p["id"], "批量原样提交", operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已批量标记 {len(pending)} 条记录")
         except Exception as e:
@@ -4319,7 +5272,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         try:
             for p in pending:
-                self.service.discard_draft_item(p["id"], "批量放弃")
+                self.service.discard_draft_item(p["id"], "批量放弃", operator=self.current_user)
             self._refresh_all_views()
             messagebox.showinfo("成功", f"已批量放弃 {len(pending)} 条记录")
         except Exception as e:
@@ -4378,7 +5331,7 @@ class DraftEditDialog(tk.Toplevel):
     def _on_save_remark(self):
         remark = self.remark_var.get().strip()
         try:
-            self.service.update_draft_remark(self.draft_id, remark)
+            self.service.update_draft_remark(self.draft_id, remark, operator=self.current_user)
             messagebox.showinfo("成功", "备注已保存")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
@@ -4418,7 +5371,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         filename = f"冲突清单_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         try:
-            path = self.service.export_draft_conflicts(self.draft_id, directory, filename)
+            path = self.service.export_draft_conflicts(self.draft_id, directory, filename, operator=self.current_user)
             self.service.set_export_dir(directory)
             messagebox.showinfo("导出成功", f"冲突清单已导出到:\n{path}")
         except (PermissionError, FileNotFoundError) as e:
@@ -4437,7 +5390,7 @@ class DraftEditDialog(tk.Toplevel):
             return
         filename = f"草稿明细_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         try:
-            path = self.service.export_draft_items(self.draft_id, directory, filename, selected_only=False)
+            path = self.service.export_draft_items(self.draft_id, directory, filename, selected_only=False, operator=self.current_user)
             self.service.set_export_dir(directory)
             messagebox.showinfo("导出成功", f"草稿明细已导出到:\n{path}")
         except (PermissionError, FileNotFoundError) as e:
@@ -4468,7 +5421,7 @@ class DraftEditDialog(tk.Toplevel):
         if not messagebox.askyesno("确认提交", submit_msg):
             return
 
-        fields = [("operator", "操作人", self.detail["draft"]["operator"])]
+        fields = [("operator", "操作人", self.current_user or self.detail["draft"]["operator"])]
         dlg = FormDialog(self, "提交草稿", fields)
         if dlg.result is None:
             return
@@ -6233,30 +7186,37 @@ class Application(tk.Tk):
                 messagebox.showerror("导入失败", f"导入时发生错误:\n{e}")
 
     def _on_draft_list(self):
-        dlg = DraftListDialog(self, self.service)
+        fields = [("current_user", "当前操作人(留空为只读模式)", "")]
+        dlg_user = FormDialog(self, "身份确认", fields, width=360)
+        if dlg_user.result is None:
+            return
+        current_user = dlg_user.result.get("current_user", "").strip()
+        dlg = DraftListDialog(self, self.service, current_user=current_user)
         if not dlg.result:
             return
 
         action = dlg.result.get("action", "")
         draft_id = dlg.result.get("draft_id")
+        result_user = dlg.result.get("current_user", current_user)
 
         if action == "new":
             self._on_batch_import()
         elif action == "edit":
-            self._open_draft_edit(draft_id)
+            self._open_draft_edit(draft_id, result_user)
         elif action == "submit":
-            self._open_draft_edit(draft_id)
+            self._open_draft_edit(draft_id, result_user)
         elif action == "delete":
             pass
         elif action == "export":
-            self._do_export_draft(draft_id)
+            self._do_export_draft(draft_id, result_user)
 
-    def _open_draft_edit(self, draft_id):
-        fields = [("current_user", "当前操作人", "")]
-        dlg_user = FormDialog(self, "身份确认", fields)
-        if dlg_user.result is None:
-            return
-        current_user = dlg_user.result.get("current_user", "").strip()
+    def _open_draft_edit(self, draft_id, current_user=None):
+        if current_user is None:
+            fields = [("current_user", "当前操作人", "")]
+            dlg_user = FormDialog(self, "身份确认", fields)
+            if dlg_user.result is None:
+                return
+            current_user = dlg_user.result.get("current_user", "").strip()
         dlg = DraftEditDialog(self, self.service, draft_id, current_user=current_user)
         if dlg.result and dlg.result.get("action") == "submitted":
             self._refresh_table()
@@ -6270,7 +7230,7 @@ class Application(tk.Tk):
             if messagebox.askyesno("提交成功", msg + "\n\n是否导出本次明细？"):
                 self._do_export_batch(dlg.result.get("batch_id"))
 
-    def _do_export_draft(self, draft_id):
+    def _do_export_draft(self, draft_id, current_user=""):
         export_dir = self.service.get_export_dir()
         directory = filedialog.askdirectory(initialdir=export_dir, title="选择草稿明细导出目录")
         if not directory:
@@ -6281,7 +7241,7 @@ class Application(tk.Tk):
             return
         filename = f"草稿明细_{draft['draft_no']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         try:
-            path = self.service.export_draft_items(draft_id, directory, filename, selected_only=False)
+            path = self.service.export_draft_items(draft_id, directory, filename, selected_only=False, operator=current_user)
             self.service.set_export_dir(directory)
             messagebox.showinfo("导出成功", f"草稿明细已导出到:\n{path}")
         except (PermissionError, FileNotFoundError) as e:
